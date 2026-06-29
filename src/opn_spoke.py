@@ -90,10 +90,13 @@ class OpnSpoke(BaseSpoke):
         # Normalize command type to uppercase for case-insensitive matching
         normalized_cmd = command_type.upper()
 
-        # Mask sensitive data for logging
+        # Mask sensitive data for logging — FULL mask. The previous
+        # "{v[:4]}...{v[-4:]}" leaked both ends of the credential (8+ chars of
+        # an api_key/api_secret exposed in telemetry/SPOKE_LOG relayed to the
+        # hub), which is a meaningful fraction of a typical OPNsense API secret.
+        _SENSITIVE = {"api_key", "api_secret", "password"}
         log_data = {
-            k: (f"{str(v)[:4]}...{str(v)[-4:]}" if len(str(v)) > 8 else "***")
-            if k in ["api_key", "api_secret", "password"] else v
+            k: ("********" if k in _SENSITIVE else v)
             for k, v in data.items()
         } if isinstance(data, dict) else data
 
