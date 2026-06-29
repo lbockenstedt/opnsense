@@ -205,6 +205,7 @@ class OpnsenseEngine:
                         "protocol": r.get("protocol", "TCP").upper(),
                         "source": source,
                         "destination": destination,
+                        "category": r.get("category") or "",
                         "description": r.get("description") or r.get("descr", "No description")
                     })
                 else:
@@ -305,6 +306,7 @@ class OpnsenseEngine:
                                 "external_port": rule.get("destination.port") or rule.get("external_port") or rule.get("dest_port") or "N/A",
                                 "internal_ip": rule.get("target") or rule.get("internal_ip") or rule.get("dest_address") or "unknown",
                                 "internal_port": rule.get("local-port") or rule.get("internal_port") or rule.get("dest_port") or "All",
+                                "category": rule.get("category") or "",
                                 "description": rule.get("descr") or rule.get("description") or f"{label} Rule"
                             })
                             # Debug log to help identify missing fields if user reports issues
@@ -344,6 +346,7 @@ class OpnsenseEngine:
                         "name": row.get("name", ""),
                         "type": row.get("type", ""),
                         "content": row.get("content", ""),
+                        "category": row.get("category") or "",
                         "description": row.get("description", ""),
                     })
             return {"status": "SUCCESS", "data": processed}
