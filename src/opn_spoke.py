@@ -63,6 +63,7 @@ class OpnSpoke(BaseSpoke):
             "GET_INTERFACE_STATUS": self.engine.get_interface_status,
             "GET_SYSTEM_HEALTH": self.engine.get_system_health,
             "OPNSENSE_GET_DHCP_LEASES": self.engine.get_dhcp_leases,
+            "OPNSENSE_GET_ARP_TABLE": self.engine.get_arp_table,
             "OPNSENSE_GET_ALL_RULES": self.engine.get_all_firewall_rules,
             "OPNSENSE_GET_FIREWALL_STATS": self.engine.get_firewall_stats,
             "OPNSENSE_GET_NAT_POLICIES": self.engine.get_nat_policies,
@@ -132,11 +133,24 @@ class OpnSpoke(BaseSpoke):
             logger.info("Manual OPNsense cache refresh triggered")
             return await self.refresh_cache()
 
+        # Sync path: an explicit ``limit`` on DHCP leases bypasses the
+        # (200-capped) cache so the firewall→NetBox discovery sync gets the full
+        # lease set. The interactive path sends no limit and gets the capped
+        # cached value (LLM payload guard preserved).
+        if (normalized_cmd == "OPNSENSE_GET_DHCP_LEASES"
+                and isinstance(data, dict) and data.get("limit") is not None):
+            try:
+                limit = int(data.get("limit", 200))
+            except (TypeError, ValueError):
+                limit = 200
+            return await self.engine.get_dhcp_leases(limit=limit)
+
         # Check if command is cacheable and has a cached value
         cache_map = {
             "GET_INTERFACE_STATUS": "interface_status",
             "GET_SYSTEM_HEALTH": "system_health",
             "OPNSENSE_GET_DHCP_LEASES": "dhcp_leases",
+            "OPNSENSE_GET_ARP_TABLE": "arp_table",
             "OPNSENSE_GET_ALL_RULES": "all_rules",
             "OPNSENSE_GET_FIREWALL_STATS": "firewall_stats",
             "OPNSENSE_GET_NAT_POLICIES": "nat_policies",
@@ -190,6 +204,9 @@ class OpnSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": f"Curl test failed: {str(e)}"}
         elif normalized_cmd == "OPNSENSE_GET_DHCP_LEASES":
             return await self.engine.get_dhcp_leases()
+
+        elif normalized_cmd == "OPNSENSE_GET_ARP_TABLE":
+            return await self.engine.get_arp_table()
 
         elif normalized_cmd == "OPNSENSE_GET_ALL_RULES":
             return await self.engine.get_all_firewall_rules()

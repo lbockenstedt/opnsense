@@ -515,8 +515,14 @@ class OpnsenseEngine:
 
         return {"status": "SUCCESS", "ip": ip, "rules": filtered_rules}
 
-    async def get_dhcp_leases(self) -> Dict[str, Any]:
-        """Fetches current DHCP leases using the Kea DHCP server."""
+    async def get_dhcp_leases(self, limit: int = 200) -> Dict[str, Any]:
+        """Fetches current DHCP leases using the Kea DHCP server.
+
+        ``limit`` caps the result count (default 200) — a guard against massive
+        payloads hitting LLM Payload-Too-Large errors on the interactive/search
+        path. The firewall→NetBox discovery sync passes ``limit=0`` to get the
+        full lease set (it bypasses the capped cache at the spoke layer).
+        """
         res = await self._request("GET", "/api/kea/leases4/search")
 
         if isinstance(res, dict):
@@ -541,11 +547,53 @@ class OpnsenseEngine:
                         "lease_end": str(expire_ts) if expire_ts else "unknown"
                     })
 
-            # Safety limit to prevent massive payloads causing LLM 400 errors (Payload Too Large)
-            if len(processed_leases) > 200:
-                logger.warning(f"Truncating DHCP leases from {len(processed_leases)} to 200 for stability")
-                processed_leases = processed_leases[:200]
+            # Safety limit to prevent massive payloads causing LLM 400 errors
+            # (Payload Too Large) on the interactive path. limit<=0 disables it
+            # so the discovery sync gets the full set.
+            if limit and limit > 0 and len(processed_leases) > limit:
+                logger.warning(f"Truncating DHCP leases from {len(processed_leases)} to {limit} for stability")
+                processed_leases = processed_leases[:limit]
 
             return {"status": "SUCCESS", "data": processed_leases}
 
         return {"status": "ERROR", "message": "Unexpected API response format"}
+
+    async def get_arp_table(self) -> Dict[str, Any]:
+        """Fetches the firewall's ARP table — every IP→MAC pair for a neighbor
+        the firewall has recently talked to.
+
+        Complements DHCP leases by capturing STATIC-IP devices that never
+        appear in DHCP — the gap that left their NetBox IP records without a
+        ``mac_address`` and broke the CPPM endpoint sync's IP→MAC resolution.
+        Used by the firewall→NetBox device discovery sync. No cap: the sync
+        wants the full neighbor set. The MAC is returned raw; the hub/netbox
+        normalize it.
+        """
+        res = await self._request("GET", "/api/diagnostics/interface/search_arp")
+
+        if isinstance(res, dict):
+            rows = res.get("rows")
+            if rows is None:
+                # Some OPNsense versions return the list under a different key.
+                rows = res.get("data") or []
+            if not isinstance(rows, list):
+                rows = []
+
+            arp = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                ip = (row.get("ip") or row.get("address") or "").strip()
+                mac = (row.get("mac") or row.get("hwaddr") or "").strip()
+                if not ip and not mac:
+                    continue
+                arp.append({
+                    "ip": ip or "unknown",
+                    "mac": mac or "unknown",
+                    "hostname": (row.get("hostname") or "").strip() or "unknown",
+                    "interface": (row.get("intf") or row.get("interface") or "").strip(),
+                })
+
+            return {"status": "SUCCESS", "data": arp}
+
+        return {"status": "ERROR", "message": "Unexpected ARP API response format"}

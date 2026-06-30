@@ -39,8 +39,12 @@ The OPNsense Spoke acts as a bridge between the Lab Manager Hub and the OPNsense
   - **Response**: `{"status": "SUCCESS", "ip": "string", "rules": [...]}`
 - **`OPNSENSE_GET_DHCP_LEASES`**
   - **Purpose**: Lists current DHCP leases.
+  - **Payload**: `{}` (cached, capped at 200 for the interactive path) **or** `{"limit": 0}` to bypass the cache and return the full uncapped set (used by the firewall→NetBox discovery sync).
+  - **Response**: `{"status": "SUCCESS", "data": [{"ip", "hostname", "mac", "lease_end"}, ...]}`
+- **`OPNSENSE_GET_ARP_TABLE`**
+  - **Purpose**: Lists the firewall's ARP table — every IP→MAC pair for a neighbor it has recently talked to. Captures static-IP devices that never appear in DHCP (cached).
   - **Payload**: `{}`
-  - **Response**: `{"status": "SUCCESS", "data": [...]}`
+  - **Response**: `{"status": "SUCCESS", "data": [{"ip", "mac", "hostname", "interface"}, ...]}` (MAC returned raw; the hub/NetBox normalize it).
 - **`OPNSENSE_GET_ALL_RULES`**
   - **Purpose**: Lists all firewall rules.
   - **Payload**: `{}`
