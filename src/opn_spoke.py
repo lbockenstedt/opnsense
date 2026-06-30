@@ -45,7 +45,19 @@ class OpnSpoke(BaseSpoke):
             logger.warning("Event loop not running; refresh loop will be started manually or on first request")
 
     async def _cache_refresh_loop(self):
-        """Background loop to refresh the cache periodically."""
+        """Background loop to refresh the cache periodically.
+
+        Primes the cache once immediately on startup (before the first sleep)
+        so a freshly-(re)started spoke doesn't serve a cold cache for the whole
+        interval — that left every cacheable read (notably NAT policies, whose
+        live fetch probes 3 endpoints sequentially) to a slow live round-trip
+        that blew the hub's request_response budget and rendered the tab empty.
+        """
+        try:
+            logger.info("Priming OPNsense cache on startup")
+            await self.refresh_cache()
+        except Exception as e:
+            logger.error(f"Initial OPNsense cache refresh failed: {e}")
         while True:
             try:
                 await asyncio.sleep(self._refresh_interval)
@@ -86,6 +98,14 @@ class OpnSpoke(BaseSpoke):
                 results[cmd] = f"Exception: {str(e)}"
 
         return {"status": "SUCCESS", "refreshed": results}
+
+    def _cache_live(self, cmd: str, res: Dict[str, Any]) -> Dict[str, Any]:
+        """Store a live-fetched cacheable result so the next call hits the cache
+        instead of re-doing the slow live round-trip. Only caches SUCCESS (mirrors
+        refresh_cache). Best-effort: returns ``res`` unchanged regardless."""
+        if isinstance(res, dict) and res.get("status") == "SUCCESS":
+            self._cache[cmd] = res
+        return res
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         # Normalize command type to uppercase for case-insensitive matching
@@ -181,10 +201,10 @@ class OpnSpoke(BaseSpoke):
             return await self.engine.manage_alias(data.get("name"), data.get("hosts"), action="update")
 
         elif normalized_cmd == "GET_INTERFACE_STATUS":
-            return await self.engine.get_interface_status()
+            return self._cache_live(normalized_cmd, await self.engine.get_interface_status())
 
         elif normalized_cmd == "GET_SYSTEM_HEALTH":
-            return await self.engine.get_system_health()
+            return self._cache_live(normalized_cmd, await self.engine.get_system_health())
 
         elif normalized_cmd == "OPNSENSE_GET_RULES_BY_IP":
             return await self.engine.get_rules_for_ip(data.get("ip", ""))
@@ -206,22 +226,22 @@ class OpnSpoke(BaseSpoke):
             return await self.engine.get_dhcp_leases()
 
         elif normalized_cmd == "OPNSENSE_GET_ARP_TABLE":
-            return await self.engine.get_arp_table()
+            return self._cache_live(normalized_cmd, await self.engine.get_arp_table())
 
         elif normalized_cmd == "OPNSENSE_GET_ALL_RULES":
-            return await self.engine.get_all_firewall_rules()
+            return self._cache_live(normalized_cmd, await self.engine.get_all_firewall_rules())
 
         elif normalized_cmd == "OPNSENSE_GET_FIREWALL_STATS":
-            return await self.engine.get_firewall_stats()
+            return self._cache_live(normalized_cmd, await self.engine.get_firewall_stats())
 
         elif normalized_cmd == "OPNSENSE_GET_NAT_POLICIES":
-            return await self.engine.get_nat_policies()
+            return self._cache_live(normalized_cmd, await self.engine.get_nat_policies())
 
         elif normalized_cmd == "OPNSENSE_GET_DNS_RECORDS":
-            return await self.engine.get_dns_records()
+            return self._cache_live(normalized_cmd, await self.engine.get_dns_records())
 
         elif normalized_cmd == "OPNSENSE_GET_ALIASES":
-            return await self.engine.get_all_aliases()
+            return self._cache_live(normalized_cmd, await self.engine.get_all_aliases())
 
         elif normalized_cmd == "OPNSENSE_ADD_ALIAS":
             return await self.engine.add_alias(
