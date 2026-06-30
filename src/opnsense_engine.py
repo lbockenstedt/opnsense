@@ -263,6 +263,27 @@ class OpnsenseEngine:
 
         return {"status": "ERROR", "message": "Unexpected API response format"}
 
+    @staticmethod
+    def _nat_source(rule: dict) -> str:
+        """Extract a NAT rule's source address into a single displayable string.
+
+        OPNsense NAT search_rule rows expose the source under several possible
+        keys (``source`` as a dict or string, ``%source.network`` /
+        ``source.network`` / ``source.address``). Returns the first non-empty,
+        non-``any`` value found, else ``"any"`` so the LM subnet filter can treat
+        an unspecified source as a wildcard (skipped, not matched).
+        """
+        for key in ("source", "%source.network", "source.network", "source.address", "source_net"):
+            v = rule.get(key)
+            if v is None:
+                continue
+            if isinstance(v, dict):
+                v = v.get("address") or v.get("network") or v.get("any") or ""
+            s = str(v or "").strip()
+            if s and s.lower() != "any":
+                return s
+        return "any"
+
     async def get_nat_policies(self) -> Dict[str, Any]:
         """Fetches NAT policies from OPNsense.
         Probes multiple NAT endpoints (Destination NAT, Outbound NAT, 1:1 NAT) to ensure full coverage.
@@ -302,6 +323,7 @@ class OpnsenseEngine:
                                 "id": rule.get("uuid", "unknown"),
                                 "type": label,
                                 "protocol": rule.get("protocol", "TCP"),
+                                "source": _nat_source(rule),
                                 "external_ip": rule.get("%destination.network") or rule.get("destination.network") or "any",
                                 "external_port": rule.get("destination.port") or rule.get("external_port") or rule.get("dest_port") or "N/A",
                                 "internal_ip": rule.get("target") or rule.get("internal_ip") or rule.get("dest_address") or "unknown",
