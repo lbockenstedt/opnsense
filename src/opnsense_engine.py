@@ -374,9 +374,11 @@ class OpnsenseEngine:
             return {"status": "SUCCESS", "data": processed}
         return {"status": "ERROR", "message": "Unexpected API response format"}
 
-    async def add_alias(self, name: str, type_: str, content: str, description: str = "") -> Dict[str, Any]:
-        """Adds a new firewall alias."""
-        data = {"alias": {"name": name, "type": type_, "content": content, "description": description, "enabled": "1"}}
+    async def add_alias(self, name: str, type_: str, content: str, description: str = "", category: str = "") -> Dict[str, Any]:
+        """Adds a new firewall alias. ``category`` tags the alias so the LM hub
+        tenant filter can attribute it to a tenant by name/slug (an alias whose
+        category matches the tenant shows regardless of its content IPs)."""
+        data = {"alias": {"name": name, "type": type_, "content": content, "description": description, "category": category, "enabled": "1"}}
         res = await self._request("POST", "/api/firewall/alias/addItem", data=data)
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
@@ -458,9 +460,10 @@ class OpnsenseEngine:
         await self.apply_firewall_changes()
         return {"status": "SUCCESS", "message": f"Rule {uuid} updated"}
 
-    async def edit_alias(self, uuid: str, name: str, type_: str, content: str, description: str = "") -> Dict[str, Any]:
-        """Updates an existing alias by UUID."""
-        data = {"alias": {"name": name, "type": type_, "content": content, "description": description, "enabled": "1"}}
+    async def edit_alias(self, uuid: str, name: str, type_: str, content: str, description: str = "", category: str = "") -> Dict[str, Any]:
+        """Updates an existing alias by UUID. ``category`` tags the alias for LM
+        tenant attribution (matches the tenant's name/slug/netbox-slug/id)."""
+        data = {"alias": {"name": name, "type": type_, "content": content, "description": description, "category": category, "enabled": "1"}}
         res = await self._request("POST", f"/api/firewall/alias/setItem/{uuid}", data=data)
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res

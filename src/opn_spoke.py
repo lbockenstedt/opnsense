@@ -228,7 +228,8 @@ class OpnSpoke(BaseSpoke):
                 data.get("name", ""),
                 data.get("type", "host"),
                 data.get("content", ""),
-                data.get("description", "")
+                data.get("description", ""),
+                data.get("category", "")
             )
 
         elif normalized_cmd == "OPNSENSE_DEL_ALIAS":
@@ -275,7 +276,8 @@ class OpnSpoke(BaseSpoke):
                 data.get("name", ""),
                 data.get("type", "host"),
                 data.get("content", ""),
-                data.get("description", "")
+                data.get("description", ""),
+                data.get("category", "")
             )
 
         elif normalized_cmd == "OPNSENSE_EDIT_NAT_RULE":
