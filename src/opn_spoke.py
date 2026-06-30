@@ -314,5 +314,9 @@ class OpnSpoke(BaseSpoke):
         }
 
     def get_version(self) -> str:
-        """Returns the current version of the OPNsense module."""
-        return "1.0.0"
+        """Returns the current version of the OPNsense module (from the VERSION file)."""
+        from pathlib import Path
+        try:
+            return (Path(__file__).parent.parent / "VERSION").read_text().strip()
+        except Exception:
+            return "unknown"
