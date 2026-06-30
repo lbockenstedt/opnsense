@@ -155,6 +155,29 @@ class OpnsenseEngine:
             return {"status": "ERROR", "details": res}
         return {"status": "SUCCESS", "data": res}
 
+    @staticmethod
+    def _rule_category(r: dict) -> str:
+        """Extract a rule's category for LM tenant attribution + display.
+
+        OPNsense exposes the rule category two ways depending on API/endpoint:
+        the legacy filter API returns a comma-separated ``category`` string
+        (the pfSense ``<category>`` config value); the MVC filter API returns a
+        ``categories`` multi-select dict ``{name: {"selected": "1"|"0"}}``.
+        Return the category string either way (legacy value as-is; MVC
+        selected names joined by ``,``) so the LM hub tenant filter can match
+        a rule tagged with the tenant's name/slug.
+        """
+        cat = r.get("category")
+        if isinstance(cat, str) and cat.strip():
+            return cat.strip()
+        cats = r.get("categories")
+        if isinstance(cats, dict):
+            selected = [name for name, v in cats.items()
+                        if isinstance(v, dict) and str(v.get("selected", "")) in ("1", "true") and name]
+            if selected:
+                return ",".join(selected)
+        return ""
+
     async def get_all_firewall_rules(self) -> Dict[str, Any]:
         """Fetches all firewall rules across all interfaces."""
         res = await self._request("POST", "/api/firewall/filter/search_rule", data={})
@@ -205,7 +228,7 @@ class OpnsenseEngine:
                         "protocol": r.get("protocol", "TCP").upper(),
                         "source": source,
                         "destination": destination,
-                        "category": r.get("category") or "",
+                        "category": self._rule_category(r),
                         "description": r.get("description") or r.get("descr", "No description")
                     })
                 else:
