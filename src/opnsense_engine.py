@@ -285,68 +285,103 @@ class OpnsenseEngine:
 
     async def get_nat_policies(self) -> Dict[str, Any]:
         """Fetches NAT policies from OPNsense.
-        Probes multiple NAT endpoints (Destination NAT, Outbound NAT, 1:1 NAT) to ensure full coverage.
+
+        Probes the MVC NAT controllers (Destination NAT, Outbound NAT, 1:1 NAT)
+        introduced in OPNsense 26.1. Each probe is classified as found / empty /
+        errored so a total failure (e.g. firewall < 26.1 with no NAT API, or the
+        API key lacks Firewall: NAT permissions) surfaces as a loud ERROR instead
+        of degrading to an empty list — which previously rendered as
+        "No NAT Policies found" with no clue as to why.
         """
-        # Endpoints to probe for NAT rules: (url, label, method)
+        # Endpoints to probe for NAT rules: (url, label, method).
+        # The 1:1 controller is `one_to_one` (not `nat_1to1`); the others are
+        # the documented d_nat / source_nat controllers from the OPNsense API.
         endpoints = [
             ("/api/firewall/d_nat/search_rule", "Destination NAT", "POST"),
             ("/api/firewall/source_nat/search_rule", "Outbound NAT", "GET"),
-            ("/api/firewall/nat_1to1/search_rule", "1:1 NAT", "GET")
+            ("/api/firewall/one_to_one/search_rule", "1:1 NAT", "GET"),
         ]
 
-        all_processed_nat = []
-        found_any = False
+        all_processed_nat: list = []
+        warnings: list = []
+        errored = 0
+        ok_endpoints = 0
+        last_error = ""
 
         for endpoint, label, method in endpoints:
             logger.info(f"Probing NAT endpoint: {endpoint} ({label}) via {method}")
 
-            # Use show_all=1 for GET requests to ensure full retrieval
             request_url = f"{endpoint}?show_all=1" if method == "GET" else endpoint
-
-            # For POST requests, we send an empty dict if no specific filter is needed,
-            # as OPNsense often expects a JSON body for search_rule POSTs
             data = {} if method == "POST" else None
-
             res = await self._request(method, request_url, data=data)
 
-            if isinstance(res, dict):
-                rows = res.get("rows") or res.get("data") or res.get("rules")
-                if rows and isinstance(rows, list):
-                    logger.info(f"Found {len(rows)} rules in {label} endpoint.")
-                    found_any = True
-                    for rule in rows:
-                        if isinstance(rule, dict):
-                            # Map OPNsense NAT fields to a consistent format
-                            # Destination NAT uses different fields than Outbound NAT
-                            all_processed_nat.append({
-                                "id": rule.get("uuid", "unknown"),
-                                "type": label,
-                                "protocol": rule.get("protocol", "TCP"),
-                                "source": _nat_source(rule),
-                                "external_ip": rule.get("%destination.network") or rule.get("destination.network") or "any",
-                                "external_port": rule.get("destination.port") or rule.get("external_port") or rule.get("dest_port") or "N/A",
-                                "internal_ip": rule.get("target") or rule.get("internal_ip") or rule.get("dest_address") or "unknown",
-                                "internal_port": rule.get("local-port") or rule.get("internal_port") or rule.get("dest_port") or "All",
-                                "description": rule.get("descr") or rule.get("description") or f"{label} Rule"
-                            })
-                            # Debug log to help identify missing fields if user reports issues
-                            if not rule.get("dest_address") and not rule.get("internal_ip"):
-                                logger.debug(f"NAT rule {rule.get('uuid')} missing IP fields. Keys: {list(rule.keys())}")
-                else:
-                    logger.info(f"No rules found in {label} endpoint.")
-            else:
-                logger.warning(f"Unexpected response format for {label} endpoint.")
+            # Classify the response. An ERROR envelope from _request (curl fail,
+            # 404, permission denied, etc.) must not be confused with a valid
+            # empty result — that conflation was the silent-empty root cause.
+            if not isinstance(res, dict) or res.get("status") == "ERROR" or "error" in res or "errorMessage" in res:
+                errored += 1
+                msg = (res.get("message") if isinstance(res, dict) else None) or str(res)
+                last_error = f"{label}: {msg}"
+                warnings.append(last_error)
+                logger.warning("[sync-error] %s: NAT probe %s failed: %s", label, endpoint, msg)
+                continue
 
-        if not found_any:
-            logger.info("All NAT endpoints probed; no rules found.")
-            return {"status": "SUCCESS", "data": [], "source": "empty"}
+            ok_endpoints += 1
+            rows = res.get("rows") or res.get("data") or res.get("rules")
+            # OPNsense sometimes returns rules keyed by uuid (a dict, not a list).
+            if isinstance(rows, dict):
+                rows = [dict({"uuid": uid}, **(v if isinstance(v, dict) else {"raw": v})) for uid, v in rows.items()]
+
+            if rows and isinstance(rows, list):
+                logger.info(f"Found {len(rows)} rules in {label} endpoint.")
+                for rule in rows:
+                    if isinstance(rule, dict):
+                        # Map OPNsense NAT fields to a consistent format.
+                        # Destination NAT uses different fields than Outbound NAT.
+                        all_processed_nat.append({
+                            "id": rule.get("uuid", "unknown"),
+                            "type": label,
+                            "protocol": rule.get("protocol", "TCP"),
+                            "source": self._nat_source(rule),
+                            "external_ip": rule.get("%destination.network") or rule.get("destination.network") or "any",
+                            "external_port": rule.get("destination.port") or rule.get("external_port") or rule.get("dest_port") or "N/A",
+                            "internal_ip": rule.get("target") or rule.get("internal_ip") or rule.get("dest_address") or "unknown",
+                            "internal_port": rule.get("local-port") or rule.get("internal_port") or rule.get("dest_port") or "All",
+                            "description": rule.get("descr") or rule.get("description") or f"{label} Rule"
+                        })
+                        if not rule.get("dest_address") and not rule.get("internal_ip"):
+                            logger.debug(f"NAT rule {rule.get('uuid')} missing IP fields. Keys: {list(rule.keys())}")
+            else:
+                logger.info(f"No rules found in {label} endpoint (valid empty response).")
+
+        # Every probe failed — almost certainly OPNsense < 26.1 (no MVC NAT API)
+        # or the API key lacks Firewall: NAT permissions. Surface a real error so
+        # the UI can tell the user instead of showing an empty list.
+        if ok_endpoints == 0:
+            logger.error("[sync-error] get_nat_policies: all %d NAT endpoints errored. Last: %s", errored, last_error)
+            return {
+                "status": "ERROR",
+                "message": (
+                    "OPNsense NAT API returned errors for all probed endpoints "
+                    "(d_nat / source_nat / one_to_one). The MVC NAT controllers "
+                    "require OPNsense 26.1+ and a Firewall: NAT API key scope. "
+                    f"Last error: {last_error}"
+                ),
+                "data": [],
+            }
 
         # Safety limit to prevent massive payloads causing LLM 400 errors (Payload Too Large)
         if len(all_processed_nat) > 200:
             logger.warning(f"Truncating NAT rules from {len(all_processed_nat)} to 200 for stability")
             all_processed_nat = all_processed_nat[:200]
 
-        return {"status": "SUCCESS", "data": all_processed_nat}
+        out: Dict[str, Any] = {"status": "SUCCESS", "data": all_processed_nat}
+        if warnings:
+            out["warnings"] = warnings
+            out["source"] = "partial" if all_processed_nat else "empty"
+        else:
+            out["source"] = "empty" if not all_processed_nat else "live"
+        return out
 
     async def apply_firewall_changes(self) -> Dict[str, Any]:
         """Applies pending firewall rule changes."""
@@ -406,11 +441,13 @@ class OpnsenseEngine:
         return res
 
     async def add_nat_rule(self, nat_type: str, rule: Dict[str, Any]) -> Dict[str, Any]:
-        """Adds a NAT rule. nat_type: 'd_nat' | 'source_nat' | 'nat_1to1'."""
+        """Adds a NAT rule. nat_type: 'd_nat' | 'source_nat' | 'one_to_one'
+        ('nat_1to1' accepted as a legacy alias for 'one_to_one')."""
         endpoint_map = {
             "d_nat": "/api/firewall/d_nat/addRule",
             "source_nat": "/api/firewall/source_nat/addRule",
-            "nat_1to1": "/api/firewall/nat_1to1/addRule",
+            "one_to_one": "/api/firewall/one_to_one/addRule",
+            "nat_1to1": "/api/firewall/one_to_one/addRule",
         }
         endpoint = endpoint_map.get(nat_type, endpoint_map["d_nat"])
         res = await self._request("POST", endpoint, data={"rule": rule})
@@ -424,7 +461,8 @@ class OpnsenseEngine:
         endpoint_map = {
             "d_nat": f"/api/firewall/d_nat/delRule/{uuid}",
             "source_nat": f"/api/firewall/source_nat/delRule/{uuid}",
-            "nat_1to1": f"/api/firewall/nat_1to1/delRule/{uuid}",
+            "one_to_one": f"/api/firewall/one_to_one/delRule/{uuid}",
+            "nat_1to1": f"/api/firewall/one_to_one/delRule/{uuid}",
         }
         endpoint = endpoint_map.get(nat_type, endpoint_map["d_nat"])
         res = await self._request("POST", endpoint, data={})
@@ -473,7 +511,8 @@ class OpnsenseEngine:
         endpoint_map = {
             "d_nat": f"/api/firewall/d_nat/setRule/{uuid}",
             "source_nat": f"/api/firewall/source_nat/setRule/{uuid}",
-            "nat_1to1": f"/api/firewall/nat_1to1/setRule/{uuid}",
+            "one_to_one": f"/api/firewall/one_to_one/setRule/{uuid}",
+            "nat_1to1": f"/api/firewall/one_to_one/setRule/{uuid}",
         }
         endpoint = endpoint_map.get(nat_type, endpoint_map["d_nat"])
         res = await self._request("POST", endpoint, data={"rule": rule})
