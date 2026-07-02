@@ -169,7 +169,16 @@ class OpnSpoke(BaseSpoke):
         cache_map = {
             "GET_INTERFACE_STATUS": "interface_status",
             "GET_SYSTEM_HEALTH": "system_health",
-            "OPNSENSE_GET_DHCP_LEASES": "dhcp_leases",
+            # DHCP leases are NOT served from this cache. Leases are volatile
+            # (clients get/release constantly) and the Kea leases4/search
+            # endpoint is a single fast GET — unlike NAT's 3-endpoint probe,
+            # there is no slow-live-fetch timeout to avoid. Caching them for
+            # the 1h refresh interval served a stale-empty list (a refresh that
+            # momentarily saw no leases, or a startup prime before Kea was
+            # ready) for up to an hour, rendering the DHCP Leases tab empty
+            # even though a live fetch would return rows. Interactive reads
+            # always go live below; the sync path's limit-bypass above is
+            # already live.
             "OPNSENSE_GET_ARP_TABLE": "arp_table",
             "OPNSENSE_GET_ALL_RULES": "all_rules",
             "OPNSENSE_GET_FIREWALL_STATS": "firewall_stats",

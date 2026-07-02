@@ -571,6 +571,10 @@ class OpnsenseEngine:
                 logger.info(f"Kea DHCP API returned success but no leases found. Response: {res}")
                 return {"status": "SUCCESS", "data": [], "source": "empty"}
 
+            # OPNsense sometimes returns row sets keyed by address/index (a dict
+            # instead of a list) — flatten so we don't silently drop every lease.
+            if isinstance(rows, dict):
+                rows = list(rows.values())
             if not isinstance(rows, list):
                 rows = []
 
