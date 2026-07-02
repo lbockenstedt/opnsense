@@ -388,8 +388,76 @@ class OpnsenseEngine:
         res = await self._request("POST", "/api/firewall/filter/apply", data={})
         return {"status": "SUCCESS", "message": "Firewall changes applied"} if not (isinstance(res, dict) and res.get("status") == "ERROR") else res
 
+    async def _alias_category_map(self) -> Dict[str, str]:
+        """``{category_uuid: name}`` from ``/api/firewall/alias/listCategories``.
+
+        OPNsense tags aliases with category *UUIDs* — the alias model field is
+        ``categories`` (a comma-separated UUID list), and ``searchItem`` injects
+        a ``categories_uuid`` array. There is no ``category`` name field on the
+        alias, so the old ``row.get("category")`` read a key the API never
+        returns and every alias rendered an empty Category. This map resolves
+        those UUIDs to display names. Best-effort: an empty map on failure just
+        yields empty categories (no worse than before)."""
+        try:
+            res = await self._request("GET", "/api/firewall/alias/listCategories")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("alias category list fetch failed: %s", e)
+            return {}
+        if not isinstance(res, dict):
+            return {}
+        rows = res.get("rows") or res.get("data") or []
+        out: Dict[str, str] = {}
+        for row in (rows if isinstance(rows, list) else []):
+            if isinstance(row, dict) and row.get("uuid") and row.get("name"):
+                out[str(row["uuid"])] = str(row["name"])
+        return out
+
+    @staticmethod
+    def _resolve_alias_category_uuids(row: Dict[str, Any],
+                                      cat_map: Dict[str, str]) -> str:
+        """Comma-separated category *names* for one alias row, resolved from the
+        UUID list OPNsense returns — ``categories_uuid`` array preferred, else the
+        ``categories`` comma-separated UUID string. Empty when none/unknown."""
+        uuids: List[str] = []
+        cu = row.get("categories_uuid")
+        if isinstance(cu, list):
+            uuids = [str(u) for u in cu if u]
+        else:
+            cats = row.get("categories")
+            if isinstance(cats, str) and cats.strip():
+                uuids = [u.strip() for u in cats.split(",") if u.strip()]
+            elif isinstance(cats, list):
+                uuids = [str(u) for u in cats if u]
+        return ", ".join(cat_map[u] for u in uuids if u and cat_map.get(u))
+
+    async def _alias_category_uuids_for(self, category: str) -> str:
+        """Resolve a comma-separated category *name* string (what the LM WebUI
+        sends and the tenant filter matches on) to the comma-separated category
+        *UUID* string OPNsense's alias model expects under ``categories``. Names
+        that don't match an existing OPNsense category are dropped with a warning
+        — OPNsense categories are first-class objects referenced by UUID, so a
+        name that isn't pre-created cannot be assigned. Empty input → empty
+        (clears the alias's categories on edit)."""
+        if not category or not str(category).strip():
+            return ""
+        cat_map = await self._alias_category_map()
+        name_to_uuid = {name: uuid for uuid, name in cat_map.items()}
+        uuids: List[str] = []
+        for name in [n.strip() for n in str(category).split(",") if n.strip()]:
+            uid = name_to_uuid.get(name)
+            if uid:
+                uuids.append(uid)
+            else:
+                logger.warning(
+                    "alias category '%s' is not a known OPNsense category — dropping",
+                    name)
+        return ",".join(uuids)
+
     async def get_all_aliases(self) -> Dict[str, Any]:
-        """Fetches all firewall aliases."""
+        """Fetches all firewall aliases. The Category column is resolved from each
+        alias's ``categories`` UUID list via ``listCategories`` — OPNsense tags
+        aliases by category UUID, not by a name field."""
+        cat_map = await self._alias_category_map()
         res = await self._request("GET", "/api/firewall/alias/searchItem")
         if isinstance(res, dict):
             rows = res.get("rows") or res.get("data") or []
@@ -401,17 +469,20 @@ class OpnsenseEngine:
                         "name": row.get("name", ""),
                         "type": row.get("type", ""),
                         "content": row.get("content", ""),
-                        "category": row.get("category") or "",
+                        "category": self._resolve_alias_category_uuids(row, cat_map),
                         "description": row.get("description", ""),
                     })
             return {"status": "SUCCESS", "data": processed}
         return {"status": "ERROR", "message": "Unexpected API response format"}
 
     async def add_alias(self, name: str, type_: str, content: str, description: str = "", category: str = "") -> Dict[str, Any]:
-        """Adds a new firewall alias. ``category`` tags the alias so the LM hub
-        tenant filter can attribute it to a tenant by name/slug (an alias whose
-        category matches the tenant shows regardless of its content IPs)."""
-        data = {"alias": {"name": name, "type": type_, "content": content, "description": description, "category": category, "enabled": "1"}}
+        """Adds a new firewall alias. ``category`` is a comma-separated category
+        *name* string (what the LM WebUI sends); it is resolved to category UUIDs
+        and sent under ``categories`` — the OPNsense alias model field. Names that
+        aren't existing OPNsense categories are dropped (see
+        ``_alias_category_uuids_for``)."""
+        cats = await self._alias_category_uuids_for(category)
+        data = {"alias": {"name": name, "type": type_, "content": content, "description": description, "categories": cats, "enabled": "1"}}
         res = await self._request("POST", "/api/firewall/alias/addItem", data=data)
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
@@ -497,9 +568,11 @@ class OpnsenseEngine:
         return {"status": "SUCCESS", "message": f"Rule {uuid} updated"}
 
     async def edit_alias(self, uuid: str, name: str, type_: str, content: str, description: str = "", category: str = "") -> Dict[str, Any]:
-        """Updates an existing alias by UUID. ``category`` tags the alias for LM
-        tenant attribution (matches the tenant's name/slug/netbox-slug/id)."""
-        data = {"alias": {"name": name, "type": type_, "content": content, "description": description, "category": category, "enabled": "1"}}
+        """Updates an existing alias by UUID. ``category`` is a comma-separated
+        category *name* string resolved to UUIDs and sent under ``categories``
+        (the OPNsense alias model field); empty clears the alias's categories."""
+        cats = await self._alias_category_uuids_for(category)
+        data = {"alias": {"name": name, "type": type_, "content": content, "description": description, "categories": cats, "enabled": "1"}}
         res = await self._request("POST", f"/api/firewall/alias/setItem/{uuid}", data=data)
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
