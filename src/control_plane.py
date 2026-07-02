@@ -8,6 +8,24 @@ except ImportError:
     from messaging.control_plane import BaseControlPlane
 from opn_spoke import OpnSpoke
 
+try:
+    from logging_setup import configure_logging
+except ImportError:
+    try:
+        from core.src.logging_setup import configure_logging
+    except ImportError:
+        import logging as _logging
+        _FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        _DFMT = '%Y-%m-%d %H:%M:%S'
+        def configure_logging(default_level=_logging.INFO, *, log_file=None, **_):
+            handlers = ([_logging.FileHandler(log_file), _logging.StreamHandler()]
+                        if log_file else None)
+            _logging.basicConfig(level=default_level, force=True,
+                                 format=_FMT, datefmt=_DFMT, handlers=handlers)
+# Configure root logging at boot. Previously this entrypoint called no
+# basicConfig at all -> root defaulted to WARNING and ALL INFO logs (API
+# request INFO, sync progress) were silently dropped at cold start.
+configure_logging()
 logger = logging.getLogger("OpnControlPlane")
 
 class OpnControlPlane(BaseControlPlane):
