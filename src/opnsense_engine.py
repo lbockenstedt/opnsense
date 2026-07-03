@@ -603,6 +603,80 @@ class OpnsenseEngine:
         await self._request("POST", "/api/unbound/service/reconfigure", data={})
         return {"status": "SUCCESS", "message": f"DNS record {uuid} updated"}
 
+    async def import_cert(self, domain: str, fullchain: str, privkey: str) -> Dict[str, Any]:
+        """Imports (or re-imports in place) a TLS certificate into OPNsense Trust.
+
+        Called by the hub's cert-distribution layer via ``OPNSENSE_INSTALL_CERT``
+        — the hub brokers cert material from the le (Let's Encrypt) spoke to each
+        target spoke, and this spoke applies it to the firewall it's in the
+        vicinity of. OPNsense trust/cert API: payload nested under ``"cert"``,
+        raw PEM (not base64), fields ``action:"import"``, ``descr``, ``cert_type:
+        "usr_cert"``, ``private_key_location:"firewall"``, ``crt_payload`` (leaf
+        cert), ``prv_payload`` (key), ``csr_payload:""``. ``fullchain`` is split
+        so only the leaf is sent as ``crt_payload``; importing the intermediate/
+        CA into Trust→Authorities is a follow-up (the signing CA must already be
+        trusted or the import errors "missing CA key"). Idempotent: an existing
+        cert with ``descr == domain`` is updated via ``/set/<uuid>`` rather than
+        re-added, so renewals refresh the same cert object. No reconfigure apply
+        endpoint exists for trust/cert.
+        """
+        leaf = self._split_leaf_cert(fullchain)
+        if not leaf or not privkey:
+            return {"status": "ERROR",
+                    "message": "import_cert requires fullchain (with a leaf) and privkey PEM"}
+        cert_payload = {
+            "action": "import", "descr": domain or "lm-managed",
+            "cert_type": "usr_cert", "private_key_location": "firewall",
+            "crt_payload": leaf, "prv_payload": privkey, "csr_payload": "",
+        }
+        # Find an existing cert with this descr → update in place (idempotent renew).
+        existing_uuid = await self._find_cert_uuid(domain or "")
+        if existing_uuid:
+            res = await self._request("POST", f"/api/trust/cert/set/{existing_uuid}",
+                                      data={"cert": cert_payload})
+            action = "updated"
+        else:
+            res = await self._request("POST", "/api/trust/cert/add",
+                                      data={"cert": cert_payload})
+            action = "added"
+        if isinstance(res, dict) and res.get("status") == "ERROR":
+            return res
+        return {"status": "SUCCESS", "message": f"cert '{domain}' {action}"}
+
+    @staticmethod
+    def _split_leaf_cert(fullchain: str) -> str:
+        """Return the first ``-----BEGIN CERTIFICATE-----…END CERTIFICATE-----``
+        block (the leaf) from a fullchain PEM, or ``""`` if none."""
+        if not fullchain:
+            return ""
+        marker = "-----BEGIN CERTIFICATE-----"
+        start = fullchain.find(marker)
+        if start < 0:
+            return ""
+        end = fullchain.find("-----END CERTIFICATE-----", start)
+        if end < 0:
+            return ""
+        return fullchain[start:end + len("-----END CERTIFICATE-----")] + "\n"
+
+    async def _find_cert_uuid(self, descr: str) -> Optional[str]:
+        """Search Trust→certs for one whose ``descr`` matches; return its uuid
+        or ``None``. The OPNsense search endpoint is ``POST /api/trust/cert/search``
+        (rows carry ``uuid`` + ``descr``)."""
+        if not descr:
+            return None
+        try:
+            res = await self._request("POST", "/api/trust/cert/search",
+                                      data={"search": descr})
+        except Exception:
+            return None
+        if not isinstance(res, dict):
+            return None
+        rows = res.get("rows") or res.get("data") or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("descr") == descr and row.get("uuid"):
+                return row.get("uuid")
+        return None
+
     async def get_rules_for_ip(self, ip: str) -> Dict[str, Any]:
         """Fetches all firewall rules associated with a specific IP address."""
         # Fetch all rules and filter by source/destination IP in Python

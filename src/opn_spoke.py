@@ -115,7 +115,7 @@ class OpnSpoke(BaseSpoke):
         # "{v[:4]}...{v[-4:]}" leaked both ends of the credential (8+ chars of
         # an api_key/api_secret exposed in telemetry/SPOKE_LOG relayed to the
         # hub), which is a meaningful fraction of a typical OPNsense API secret.
-        _SENSITIVE = {"api_key", "api_secret", "password"}
+        _SENSITIVE = {"api_key", "api_secret", "password", "privkey", "private_key"}
         log_data = {
             k: ("********" if k in _SENSITIVE else v)
             for k, v in data.items()
@@ -323,6 +323,18 @@ class OpnSpoke(BaseSpoke):
                 data.get("domain", ""),
                 data.get("ip", ""),
                 data.get("description", "")
+            )
+
+        elif normalized_cmd == "OPNSENSE_INSTALL_CERT":
+            # Hub-brokered cert distribution: the hub pulls cert material from the
+            # le (Let's Encrypt) spoke and pushes INSTALL_CERT here; this spoke
+            # applies it to the firewall it's in the vicinity of. ``privkey`` is a
+            # secret — masked in the log line above (see _SENSITIVE) and never
+            # persisted beyond the import call.
+            return await self.engine.import_cert(
+                data.get("domain", ""),
+                data.get("fullchain", ""),
+                data.get("privkey", ""),
             )
 
         elif normalized_cmd == "SEARCH_DHCP":
