@@ -197,15 +197,7 @@ class OpnSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": "Missing path for PROBE_API"}
             return await self.engine._request("GET", path)
 
-        if normalized_cmd == "OPNSENSE_ADD_RULE":
-            # Data expected: {"rule": {...}}
-            return await self.engine.add_firewall_rule(data.get("rule", {}))
-
-        elif normalized_cmd == "OPNSENSE_DEL_RULE":
-            # Data expected: {"rule_id": "123"}
-            return await self.engine.delete_firewall_rule(data.get("rule_id"))
-
-        elif normalized_cmd == "OPNSENSE_UPDATE_ALIAS":
+        if normalized_cmd == "OPNSENSE_UPDATE_ALIAS":
             # Data expected: {"name": "web_servers", "hosts": ["1.1.1.1", "2.2.2.2"]}
             return await self.engine.manage_alias(data.get("name"), data.get("hosts"), action="update")
 
