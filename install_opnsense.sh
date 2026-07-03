@@ -2,7 +2,13 @@
 set -e
 
 # Default Configuration
-HUB_URL="ws://localhost:8765"
+# HUB_URL defaults to "auto": the spoke auto-discovers the hub (DNS
+# lm-hub.<suffix> then mDNS) on each connect via BaseControlPlane. The old
+# "ws://localhost:8765" default is BROKEN now that the hub's bare 8765 listener
+# was retired by the unified-:443 merge (the hub serves only on :443); a
+# co-located spoke dialed a dead port and a remote one dialed its own localhost.
+# Pass --hub <url> to pin.
+HUB_URL="${HUB_URL:-auto}"
 SPOKE_ID="${SPOKE_ID:-opn-$(hostname -s)}"
 SPOKE_SECRET="lm-secret"
 
@@ -108,7 +114,7 @@ User=svc_lm
 WorkingDirectory=$INSTALL_DIR/opnsense
 EnvironmentFile=$INSTALL_DIR/opnsense/.env
 Environment="PYTHONPATH=$INSTALL_DIR:$INSTALL_DIR/core/src:$INSTALL_DIR/opnsense/src"
-ExecStart=$INSTALL_DIR/opnsense/venv/bin/python3 -m src.control_plane --id \$SPOKE_ID --secret=\$SPOKE_SECRET --hub \$HUB_URL --hub-secret=\$HUB_SECRET
+ExecStart=$INSTALL_DIR/opnsense/venv/bin/python3 -m src.control_plane --id "\$SPOKE_ID" --secret=\$SPOKE_SECRET --hub "\$HUB_URL" --hub-secret="\$HUB_SECRET"
 StandardOutput=append:/var/log/lm/lm-opnsense.log
 StandardError=append:/var/log/lm/lm-opnsense.log
 Restart=always

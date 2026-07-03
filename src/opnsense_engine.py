@@ -1,8 +1,9 @@
 import logging
 import os
 import base64
+import re
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger("OpnsenseEngine")
 
@@ -609,21 +610,34 @@ class OpnsenseEngine:
         Called by the hub's cert-distribution layer via ``OPNSENSE_INSTALL_CERT``
         — the hub brokers cert material from the le (Let's Encrypt) spoke to each
         target spoke, and this spoke applies it to the firewall it's in the
-        vicinity of. OPNsense trust/cert API: payload nested under ``"cert"``,
-        raw PEM (not base64), fields ``action:"import"``, ``descr``, ``cert_type:
-        "usr_cert"``, ``private_key_location:"firewall"``, ``crt_payload`` (leaf
-        cert), ``prv_payload`` (key), ``csr_payload:""``. ``fullchain`` is split
-        so only the leaf is sent as ``crt_payload``; importing the intermediate/
-        CA into Trust→Authorities is a follow-up (the signing CA must already be
-        trusted or the import errors "missing CA key"). Idempotent: an existing
-        cert with ``descr == domain`` is updated via ``/set/<uuid>`` rather than
-        re-added, so renewals refresh the same cert object. No reconfigure apply
-        endpoint exists for trust/cert.
+        vicinity of. The fullchain is split: the leaf goes to Trust→cert
+        (``crt_payload``; payload nested under ``"cert"``, raw PEM not base64,
+        fields ``action:"import"``, ``descr``, ``cert_type:"usr_cert"``,
+        ``private_key_location:"firewall"``, ``prv_payload`` key, ``csr_payload:""``)
+        and the intermediates/root are imported into Trust→Authorities FIRST as
+        CAs (``/api/trust/ca/add``|``/set/<uuid>``, payload under ``"ca"``) so the
+        leaf import doesn't error "missing CA key" when the signing CA isn't
+        already trusted. CA import is best-effort — a CA that's already trusted
+        (e.g. a public root) may error on re-import and must NOT abort the leaf.
+        Idempotent: an existing cert/CA with matching ``descr`` is updated via
+        ``/set/<uuid>`` rather than re-added, so renewals refresh the same object.
+        No reconfigure/apply endpoint exists for trust/cert; auto-assigning the
+        imported cert to the WebUI/HAProxy listener is a follow-up (the first
+        assignment is UI-only in OPNsense, then ``/set/<uuid>`` renews in place).
         """
-        leaf = self._split_leaf_cert(fullchain)
+        leaf, ca_blocks = self._split_chain(fullchain)
         if not leaf or not privkey:
             return {"status": "ERROR",
                     "message": "import_cert requires fullchain (with a leaf) and privkey PEM"}
+        # Import signing CAs (intermediates/root) into Trust→Authorities first.
+        # Best-effort: a benign duplicate-root error must not block the leaf.
+        base = domain or "lm-managed"
+        ca_imports: List[Dict[str, Any]] = []
+        for idx, ca_pem in enumerate(ca_blocks, 1):
+            ca_descr = f"lm-le-{base}-ca" if len(ca_blocks) == 1 else f"lm-le-{base}-ca{idx}"
+            r = await self.import_ca(ca_descr, ca_pem)
+            ca_imports.append({"descr": ca_descr, "status": r.get("status"),
+                               "message": r.get("message")})
         cert_payload = {
             "action": "import", "descr": domain or "lm-managed",
             "cert_type": "usr_cert", "private_key_location": "firewall",
@@ -640,23 +654,75 @@ class OpnsenseEngine:
                                       data={"cert": cert_payload})
             action = "added"
         if isinstance(res, dict) and res.get("status") == "ERROR":
+            # Surface the CA import results alongside so a "missing CA key" leaf
+            # failure is diagnosable (did the CA import succeed?).
+            return {"status": "ERROR", "message": res.get("message", "cert import failed"),
+                    "ca_imports": ca_imports}
+        return {"status": "SUCCESS", "message": f"cert '{domain}' {action}",
+                "ca_imports": ca_imports}
+
+    async def import_ca(self, descr: str, ca_pem: str) -> Dict[str, Any]:
+        """Import a CA certificate into Trust→Authorities (idempotent via search
+        by ``descr`` → ``/set/<uuid>`` else ``/add``). Payload nested under
+        ``"ca"``: ``action:"import"``, ``descr``, ``crt_payload`` (raw PEM). Needed
+        before importing a leaf whose signing CA isn't already trusted, else
+        OPNsense errors "missing CA key"."""
+        if not ca_pem:
+            return {"status": "ERROR", "message": "import_ca requires a CA PEM"}
+        payload = {"action": "import", "descr": descr, "crt_payload": ca_pem}
+        uuid = await self._find_ca_uuid(descr)
+        if uuid:
+            res = await self._request("POST", f"/api/trust/ca/set/{uuid}",
+                                      data={"ca": payload})
+            action = "updated"
+        else:
+            res = await self._request("POST", "/api/trust/ca/add",
+                                      data={"ca": payload})
+            action = "added"
+        if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
-        return {"status": "SUCCESS", "message": f"cert '{domain}' {action}"}
+        return {"status": "SUCCESS", "message": f"ca '{descr}' {action}"}
+
+    async def _find_ca_uuid(self, descr: str) -> Optional[str]:
+        """Search Trust→Authorities for a CA whose ``descr`` matches; return its
+        uuid or ``None``. Endpoint ``POST /api/trust/ca/search`` (rows carry
+        ``uuid`` + ``descr``)."""
+        if not descr:
+            return None
+        try:
+            res = await self._request("POST", "/api/trust/ca/search",
+                                      data={"search": descr})
+        except Exception:
+            return None
+        if not isinstance(res, dict):
+            return None
+        rows = res.get("rows") or res.get("data") or []
+        for row in rows:
+            if isinstance(row, dict) and row.get("descr") == descr and row.get("uuid"):
+                return row.get("uuid")
+        return None
+
+    @staticmethod
+    def _split_chain(fullchain: str) -> Tuple[str, List[str]]:
+        """Split a fullchain PEM into ``(leaf, [ca_blocks])``. The leaf is the
+        first ``CERTIFICATE`` block; the remaining blocks (intermediates + root)
+        are CA material for Trust→Authorities. Each returned block ends with a
+        trailing newline (OPNsense parses PEM blocks cleanly regardless)."""
+        blocks = re.findall(
+            r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            fullchain or "", re.DOTALL)
+        if not blocks:
+            return "", []
+        return blocks[0] + "\n", [b + "\n" for b in blocks[1:]]
 
     @staticmethod
     def _split_leaf_cert(fullchain: str) -> str:
         """Return the first ``-----BEGIN CERTIFICATE-----…END CERTIFICATE-----``
-        block (the leaf) from a fullchain PEM, or ``""`` if none."""
-        if not fullchain:
-            return ""
-        marker = "-----BEGIN CERTIFICATE-----"
-        start = fullchain.find(marker)
-        if start < 0:
-            return ""
-        end = fullchain.find("-----END CERTIFICATE-----", start)
-        if end < 0:
-            return ""
-        return fullchain[start:end + len("-----END CERTIFICATE-----")] + "\n"
+        block (the leaf) from a fullchain PEM, or ``""`` if none. (Kept for
+        callers/tests that only want the leaf; ``_split_chain`` is the fuller
+        split used by ``import_cert``.)"""
+        leaf, _ = OpnsenseEngine._split_chain(fullchain)
+        return leaf
 
     async def _find_cert_uuid(self, descr: str) -> Optional[str]:
         """Search Trust→certs for one whose ``descr`` matches; return its uuid

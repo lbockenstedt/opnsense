@@ -1,6 +1,7 @@
 import logging
 import argparse
 import asyncio
+import os
 from typing import Dict, Any
 try:
     from core.src.messaging.control_plane import BaseControlPlane
@@ -59,7 +60,14 @@ if __name__ == "__main__":
     parser.add_argument("--id", required=True, help="Spoke ID")
     parser.add_argument("--secret", nargs='?', const="lm-secret", default="lm-secret", help="Authentication secret (default: lm-secret)")
     parser.add_argument("--hub-secret", nargs='?', default="", const="", help="Hub authentication secret for mutual auth")
-    parser.add_argument("--hub", required=True, help="Hub WebSocket URL")
+    # --hub is NOT required: omit it (or pass 'auto'/empty) and BaseControlPlane
+    # auto-discovers the hub (DNS lm-hub.<suffix> then mDNS) on each connect.
+    # Default to the HUB_URL env (installer writes HUB_URL=auto) so an empty/
+    # unset value becomes the auto-discovery sentinel instead of an argparse
+    # crash. The old ws://localhost:8765 default is broken now that the hub's
+    # bare 8765 listener was retired by the unified-:443 merge.
+    parser.add_argument("--hub", default=os.getenv("HUB_URL") or "auto",
+                        help="Hub WebSocket URL (or 'auto' to discover; default auto)")
     args = parser.parse_args()
 
     cp = OpnControlPlane(args.id, args.secret, args.hub_secret, args.hub)
