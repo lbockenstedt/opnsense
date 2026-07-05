@@ -12,10 +12,27 @@ class OpnsenseEngine:
     Core interaction layer for the OPNsense API.
     Handles Firewall rule management and Interface monitoring.
     """
-    def __init__(self, host: str, api_key: str, api_secret: str):
+    def __init__(self, host: Optional[str], api_key: Optional[str], api_secret: Optional[str]):
         self.host = host
         self.api_key = api_key
         self.api_secret = api_secret
+        self._unconfigured_log_ts = 0.0
+
+    def is_configured(self) -> bool:
+        """True only when a real firewall connection has been supplied: a host
+        AND API credentials. There is no localhost default — an unconfigured
+        engine never attempts a connection."""
+        return bool(self.host and self.api_key and self.api_secret)
+
+    def _log_unconfigured(self) -> None:
+        """Throttled 'no firewall configured' notice (every 5 min) so an
+        unconfigured spoke doesn't flood the log with per-endpoint errors."""
+        now = time.time()
+        if now - self._unconfigured_log_ts >= 300:
+            self._unconfigured_log_ts = now
+            logger.warning("No firewall configured — supply opn_host + API "
+                           "credentials via the OPNsense connection settings; "
+                           "skipping API calls until then.")
 
     async def _request(self, method: str, endpoint: str, data: Dict = None) -> Dict[str, Any]:
         """Internal helper to handle OPNsense API requests using system curl.
@@ -25,9 +42,17 @@ class OpnsenseEngine:
         import asyncio
         import subprocess
 
+        # Guard: no connection until a firewall is configured (host + creds).
+        # Short-circuit before touching curl so an unconfigured spoke reports
+        # "no firewall configured" once (throttled) instead of hammering a
+        # localhost default and logging code-7 errors per endpoint.
+        if not self.is_configured():
+            self._log_unconfigured()
+            return {"status": "ERROR", "message": "No firewall configured"}
+
         # Use the direct endpoint which now includes the /api prefix
         url = f"https://{self.host}{endpoint}"
-        logger.info(f"Attempting API request to: {url}")
+        logger.debug(f"Attempting API request to: {url}")
 
         # Lab firewalls use self-signed certs by default. Skip TLS verification
         # unless LM_OPNSENSE_VERIFY_TLS=1 is explicitly set in the environment.

@@ -15,9 +15,14 @@ class OpnSpoke(BaseSpoke):
         # Initialize critical components before calling super().__init__.
         # If BaseSpoke starts background threads (like updater_worker), they must be able 
         # to access the engine and cache immediately.
-        host = config.get("opn_host") or config.get("host") or "localhost"
-        port = str(config.get("opn_port") or config.get("port") or "8443")
-        combined_host = f"{host}:{port}"
+        # No hard-coded connection default: a firewall must be supplied via a
+        # configuration object (the hub pushes opn_host/opn_port/api_key/
+        # api_secret through UPDATE_CONFIG). Until a host is configured the
+        # engine is UNCONFIGURED and every API call short-circuits with
+        # "no firewall configured" instead of connecting to localhost:8443.
+        host = config.get("opn_host") or config.get("host")
+        port = config.get("opn_port") or config.get("port")
+        combined_host = f"{host}:{port or 8443}" if host else None
 
         self.engine = OpnsenseEngine(
             host=combined_host,
@@ -71,6 +76,12 @@ class OpnSpoke(BaseSpoke):
 
     async def refresh_cache(self) -> Dict[str, Any]:
         """Triggers a full update of all cacheable API responses."""
+        # No firewall configured → nothing to refresh. Skip the whole sweep so
+        # an unconfigured spoke doesn't emit per-endpoint / [sync-error] noise;
+        # _log_unconfigured throttles the single "no firewall configured" line.
+        if not self.engine.is_configured():
+            self.engine._log_unconfigured()
+            return {}
         cache_map = {
             "GET_INTERFACE_STATUS": self.engine.get_interface_status,
             "GET_SYSTEM_HEALTH": self.engine.get_system_health,
@@ -128,11 +139,14 @@ class OpnSpoke(BaseSpoke):
             self.config = data
             # Update engine credentials if they are provided
             if any(k in data for k in ["opn_host", "host", "opn_port", "port", "api_key", "api_secret"]):
-                cur_h = self.engine.host.split(':')[0] if ':' in self.engine.host else self.engine.host
-                cur_p = self.engine.host.split(':')[1] if ':' in self.engine.host else "8443"
+                cur_host = self.engine.host or ""
+                cur_h = cur_host.split(':')[0] if ':' in cur_host else (cur_host or None)
+                cur_p = cur_host.split(':')[1] if ':' in cur_host else "8443"
                 host = data.get("opn_host") or data.get("host") or cur_h
                 port = str(data.get("opn_port") or data.get("port") or cur_p)
-                self.engine.host = f"{host}:{port}"
+                # Stay unconfigured (host=None) until a real host is supplied —
+                # never fall back to a localhost default.
+                self.engine.host = f"{host}:{port}" if host else None
                 self.engine.api_key = data.get("api_key", self.engine.api_key)
                 self.engine.api_secret = data.get("api_secret", self.engine.api_secret)
 
