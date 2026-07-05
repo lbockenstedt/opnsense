@@ -88,7 +88,7 @@ class OpnsenseEngine:
                 return {"status": "ERROR", "message": "Empty response from server"}
 
             result = json.loads(result_text)
-            logger.info(f"API request to {url} succeeded. Response keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
+            logger.debug(f"API request to {url} succeeded. Response keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
             return result
 
         except Exception as e:
@@ -340,7 +340,7 @@ class OpnsenseEngine:
         last_error = ""
 
         for endpoint, label, method in endpoints:
-            logger.info(f"Probing NAT endpoint: {endpoint} ({label}) via {method}")
+            logger.debug(f"Probing NAT endpoint: {endpoint} ({label}) via {method}")
 
             request_url = f"{endpoint}?show_all=1" if method == "GET" else endpoint
             data = {} if method == "POST" else None
@@ -364,7 +364,7 @@ class OpnsenseEngine:
                 rows = [dict({"uuid": uid}, **(v if isinstance(v, dict) else {"raw": v})) for uid, v in rows.items()]
 
             if rows and isinstance(rows, list):
-                logger.info(f"Found {len(rows)} rules in {label} endpoint.")
+                logger.debug(f"Found {len(rows)} rules in {label} endpoint.")
                 for rule in rows:
                     if isinstance(rule, dict):
                         # Map OPNsense NAT fields to a consistent format.
@@ -383,7 +383,7 @@ class OpnsenseEngine:
                         if not rule.get("dest_address") and not rule.get("internal_ip"):
                             logger.debug(f"NAT rule {rule.get('uuid')} missing IP fields. Keys: {list(rule.keys())}")
             else:
-                logger.info(f"No rules found in {label} endpoint (valid empty response).")
+                logger.debug(f"No rules found in {label} endpoint (valid empty response).")
 
         # Every probe failed — almost certainly OPNsense < 26.1 (no MVC NAT API)
         # or the API key lacks Firewall: NAT permissions. Surface a real error so

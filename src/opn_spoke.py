@@ -132,7 +132,7 @@ class OpnSpoke(BaseSpoke):
             for k, v in data.items()
         } if isinstance(data, dict) else data
 
-        logger.info(f"Handling Opn Command: {command_type} with data {log_data}")
+        logger.debug(f"Handling Opn Command: {command_type} with data {log_data}")
 
         if normalized_cmd == "UPDATE_CONFIG":
             logger.info(f"Updating OPNsense configuration: {log_data}")
@@ -202,7 +202,7 @@ class OpnSpoke(BaseSpoke):
         }
 
         if normalized_cmd in cache_map and normalized_cmd in self._cache:
-            logger.info(f"Returning cached data for {normalized_cmd}")
+            logger.debug(f"Returning cached data for {normalized_cmd}")
             return self._cache[normalized_cmd]
 
         if normalized_cmd == "PROBE_API":
