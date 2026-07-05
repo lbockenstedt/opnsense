@@ -55,6 +55,7 @@ if [ -d "$OLD_INSTALL_DIR" ]; then
 fi
 
 mkdir -p "$INSTALL_DIR"
+mkdir -p /var/log/lm   # systemd `append:` won't create the parent dir → unit 206/EXEC on a clean box
 cd "$INSTALL_DIR"
 
 if [ -d "opnsense" ]; then
