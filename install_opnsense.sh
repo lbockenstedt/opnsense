@@ -62,11 +62,11 @@ if [ -d "opnsense" ]; then
     echo "📂 OPNsense directory exists. Preparing for update..."
     SPOKE_PATH="$INSTALL_DIR/opnsense"
     cd "$SPOKE_PATH"
-    git pull
+    git fetch origin -q && git reset --hard origin/main   # hard-sync (soft `git pull` no-ops on a diverged/detached clone)
     cd "$INSTALL_DIR"
 elif [ -d ".git" ]; then
     # This case is for when we are already inside the opnsense dir
-    git pull
+    git fetch origin -q && git reset --hard origin/main   # hard-sync
     SPOKE_PATH="$(pwd)"
 else
     echo "🌐 Cloning OPNsense Manager repository..."
