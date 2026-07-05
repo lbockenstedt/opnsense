@@ -257,6 +257,11 @@ class OpnsenseEngine:
         res = await self._request("GET", "/api/unbound/settings/searchHostOverride")
 
         if isinstance(res, dict):
+            # Classify a _request ERROR envelope BEFORE the rows-is-None handling
+            # below — otherwise a 401/timeout (no "rows") looks like "no data" and
+            # is returned as SUCCESS+[] (and cached as empty for 1h).
+            if res.get("status") == "ERROR" or "error" in res or "errorMessage" in res:
+                return {"status": "ERROR", "details": res}
             # The response contains a 'rows' list of overrides
             rows = res.get("rows")
             if rows is None:
@@ -804,6 +809,11 @@ class OpnsenseEngine:
         res = await self._request("GET", "/api/kea/leases4/search")
 
         if isinstance(res, dict):
+            # A _request ERROR envelope has no "rows" — classify it BEFORE the
+            # rows-is-None path so an API blip isn't returned as SUCCESS+[] (which
+            # feeds "zero leases" into the NetBox discovery sync at limit=0).
+            if res.get("status") == "ERROR" or "error" in res or "errorMessage" in res:
+                return {"status": "ERROR", "details": res}
             rows = res.get("rows")
             if rows is None:
                 logger.info(f"Kea DHCP API returned success but no leases found. Response: {res}")
@@ -854,6 +864,10 @@ class OpnsenseEngine:
         res = await self._request("GET", "/api/diagnostics/interface/search_arp")
 
         if isinstance(res, dict):
+            # Classify a _request ERROR envelope before treating a missing "rows"
+            # as "no neighbors" (an API blip must not read as an empty ARP table).
+            if res.get("status") == "ERROR" or "error" in res or "errorMessage" in res:
+                return {"status": "ERROR", "details": res}
             rows = res.get("rows")
             if rows is None:
                 # Some OPNsense versions return the list under a different key.
