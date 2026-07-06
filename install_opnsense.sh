@@ -155,6 +155,9 @@ EOF
 
 systemctl daemon-reload
 systemctl enable lm-opnsense
+# Start it now (and pick up new code on a re-install). enable alone left the unit
+# inactive until the next reboot, so the spoke never connected to --hub.
+systemctl restart lm-opnsense
 
 echo "🎉 OPNsense Manager installation complete!"
 echo "🌐 Hub Target: $HUB_URL"
