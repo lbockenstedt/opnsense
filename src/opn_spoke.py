@@ -331,7 +331,12 @@ class OpnSpoke(BaseSpoke):
                 data.get("description", "")
             )
 
-        elif normalized_cmd == "OPNSENSE_INSTALL_CERT":
+        elif normalized_cmd in ("INSTALL_CERT", "OPNSENSE_INSTALL_CERT"):
+            # NOTE: the hub (cert_distribution.py) pushes a BARE ``INSTALL_CERT``
+            # to every cert-capable target (firewall/hypervisor/directory) — the
+            # same command pxmx/ldap receive. This branch previously matched only
+            # the OPNSENSE_-prefixed alias, so the hub's INSTALL_CERT fell through
+            # to unknown and certs never installed on OPNsense. Accept both.
             # Hub-brokered cert distribution: the hub pulls cert material from the
             # le (Let's Encrypt) spoke and pushes INSTALL_CERT here; this spoke
             # applies it to the firewall it's in the vicinity of. ``privkey`` is a
