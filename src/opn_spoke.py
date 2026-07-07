@@ -85,7 +85,11 @@ class OpnSpoke(BaseSpoke):
         cache_map = {
             "GET_INTERFACE_STATUS": self.engine.get_interface_status,
             "GET_SYSTEM_HEALTH": self.engine.get_system_health,
-            "OPNSENSE_GET_DHCP_LEASES": self.engine.get_dhcp_leases,
+            # OPNSENSE_GET_DHCP_LEASES is intentionally NOT in the refresh sweep:
+            # handle_command's cache_map excludes it (leases are volatile and a
+            # 1h-cached empty list rendered the DHCP tab empty; see the comment
+            # in handle_command). Refreshing it here was a wasted curl whose
+            # result was stored in self._cache but never served.
             "OPNSENSE_GET_ARP_TABLE": self.engine.get_arp_table,
             "OPNSENSE_GET_ALL_RULES": self.engine.get_all_firewall_rules,
             "OPNSENSE_GET_FIREWALL_STATS": self.engine.get_firewall_stats,
@@ -222,7 +226,24 @@ class OpnSpoke(BaseSpoke):
             return self._cache_live(normalized_cmd, await self.engine.get_system_health())
 
         elif normalized_cmd == "OPNSENSE_GET_RULES_BY_IP":
-            return await self.engine.get_rules_for_ip(data.get("ip", ""))
+            # Reuse the cached OPNSENSE_GET_ALL_RULES result when present
+            # instead of re-fetching the whole ruleset (a fresh curl) per
+            # IP query — the all-rules fetch already runs on the 1h refresh
+            # loop, so a per-IP lookup was paying a full ruleset round-trip
+            # for nothing. Fall back to a live fetch if the cache is cold.
+            ip = data.get("ip", "")
+            cached_rules = self._cache.get("OPNSENSE_GET_ALL_RULES")
+            if cached_rules and cached_rules.get("status") == "SUCCESS":
+                rules = cached_rules.get("data", [])
+                if not isinstance(rules, list):
+                    rules = []
+                filtered = [
+                    r for r in rules
+                    if ip in str(r.get("source", "")) or ip in str(r.get("destination", ""))
+                ]
+                return {"status": "SUCCESS", "ip": ip, "rules": filtered,
+                        "source": "cache"}
+            return await self.engine.get_rules_for_ip(ip)
 
         elif normalized_cmd == "OPNSENSE_CURL_TEST":
             try:
@@ -375,8 +396,17 @@ class OpnSpoke(BaseSpoke):
             return {"status": "ERROR", "message": f"Command {command_type} not supported by opnsense module"}
 
     async def get_status(self) -> Dict[str, Any]:
-        """Native LM status report for the OPNsense instance."""
-        health = await self.engine.get_system_health()
+        """Native LM status report for the OPNsense instance.
+
+        Serves the cached ``GET_SYSTEM_HEALTH`` entry when the refresh loop
+        has primed it (avoids a fresh curl on every hub heartbeat/status poll)
+        and falls back to a live fetch when the cache is cold or stale."""
+        cached = self._cache.get("GET_SYSTEM_HEALTH")
+        if cached and cached.get("status") == "SUCCESS":
+            health = cached
+        else:
+            health = self._cache_live(
+                "GET_SYSTEM_HEALTH", await self.engine.get_system_health())
         return {
             "spoke_id": self.spoke_id,
             "module": "opnsense-mgmt",

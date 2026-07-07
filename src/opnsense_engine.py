@@ -3,6 +3,7 @@ import os
 import base64
 import re
 import time
+import asyncio
 from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger("OpnsenseEngine")
@@ -17,6 +18,14 @@ class OpnsenseEngine:
         self.api_key = api_key
         self.api_secret = api_secret
         self._unconfigured_log_ts = 0.0
+        # 5-min TTL memo for _alias_category_map: get_all_aliases + every
+        # alias add/update/delete call it, and the category list changes
+        # rarely. Invalidate via _alias_category_map(invalidate=True) on
+        # alias writes that could add/rename a category (best-effort: the
+        # next TTL expiry refreshes regardless).
+        self._alias_cat_map: Optional[Dict[str, str]] = None
+        self._alias_cat_map_ts: float = 0.0
+        self._alias_cat_map_ttl = 300.0
 
     def is_configured(self) -> bool:
         """True only when a real firewall connection has been supplied: a host
@@ -339,12 +348,20 @@ class OpnsenseEngine:
         ok_endpoints = 0
         last_error = ""
 
-        for endpoint, label, method in endpoints:
-            logger.debug(f"Probing NAT endpoint: {endpoint} ({label}) via {method}")
-
+        # Probe all three NAT controllers concurrently — the serial loop paid
+        # 3 sequential curl round-trips (each a fresh TCP+TLS+Basic auth).
+        # _request is async (curl subprocess), so asyncio.gather overlaps them.
+        async def _probe(endpoint, label, method):
             request_url = f"{endpoint}?show_all=1" if method == "GET" else endpoint
             data = {} if method == "POST" else None
-            res = await self._request(method, request_url, data=data)
+            return await self._request(method, request_url, data=data)
+
+        probe_results = await asyncio.gather(
+            *[_probe(ep, lbl, m) for ep, lbl, m in endpoints]
+        )
+
+        for (endpoint, label, method), res in zip(endpoints, probe_results):
+            logger.debug(f"Probing NAT endpoint: {endpoint} ({label}) via {method}")
 
             # Classify the response. An ERROR envelope from _request (curl fail,
             # 404, permission denied, etc.) must not be confused with a valid
@@ -419,7 +436,7 @@ class OpnsenseEngine:
         res = await self._request("POST", "/api/firewall/filter/apply", data={})
         return {"status": "SUCCESS", "message": "Firewall changes applied"} if not (isinstance(res, dict) and res.get("status") == "ERROR") else res
 
-    async def _alias_category_map(self) -> Dict[str, str]:
+    async def _alias_category_map(self, invalidate: bool = False) -> Dict[str, str]:
         """``{category_uuid: name}`` from ``/api/firewall/alias/listCategories``.
 
         OPNsense tags aliases with category *UUIDs* — the alias model field is
@@ -428,19 +445,30 @@ class OpnsenseEngine:
         alias, so the old ``row.get("category")`` read a key the API never
         returns and every alias rendered an empty Category. This map resolves
         those UUIDs to display names. Best-effort: an empty map on failure just
-        yields empty categories (no worse than before)."""
+        yields empty categories (no worse than before).
+
+        5-min TTL memoized (self._alias_cat_map): get_all_aliases + every
+        alias write call this, and the category list changes rarely. Pass
+        ``invalidate=True`` after an alias add/update that could create a new
+        category to force a fresh fetch on the next call."""
+        now = time.time()
+        if (not invalidate and self._alias_cat_map is not None
+                and (now - self._alias_cat_map_ts) < self._alias_cat_map_ttl):
+            return self._alias_cat_map
         try:
             res = await self._request("GET", "/api/firewall/alias/listCategories")
         except Exception as e:  # noqa: BLE001
             logger.warning("alias category list fetch failed: %s", e)
-            return {}
+            return self._alias_cat_map or {}
         if not isinstance(res, dict):
-            return {}
+            return self._alias_cat_map or {}
         rows = res.get("rows") or res.get("data") or []
         out: Dict[str, str] = {}
         for row in (rows if isinstance(rows, list) else []):
             if isinstance(row, dict) and row.get("uuid") and row.get("name"):
                 out[str(row["uuid"])] = str(row["name"])
+        self._alias_cat_map = out
+        self._alias_cat_map_ts = now
         return out
 
     @staticmethod
