@@ -66,7 +66,7 @@ class OpnSpoke(BaseSpoke):
         while True:
             try:
                 await asyncio.sleep(self._refresh_interval)
-                logger.info(f"Performing scheduled OPNsense cache refresh (interval: {self._refresh_interval}s)")
+                logger.debug(f"Performing scheduled OPNsense cache refresh (interval: {self._refresh_interval}s)")
                 await self.refresh_cache()
             except asyncio.CancelledError:
                 break
