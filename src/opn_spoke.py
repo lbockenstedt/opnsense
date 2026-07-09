@@ -123,6 +123,17 @@ class OpnSpoke(BaseSpoke):
         return res
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch a hub command to the matching OPNsense engine action.
+
+        Routes ``OPNSENSE_*`` / ``GET_*`` commands (sent hub → spoke over the
+        WebSocket) to ``OpnsenseEngine`` methods against the configured firewall.
+        Read-heavy commands are served from the in-memory cache primed by
+        ``_cache_refresh_loop`` (DHCP leases are the deliberate uncached
+        exception); writes go straight to the live API. Sensitive fields
+        (``api_key``/``api_secret``/``password``/``privkey``/``private_key``)
+        are full-masked in the debug log line. Unknown commands return an
+        ``ERROR`` envelope.
+        """
         # Normalize command type to uppercase for case-insensitive matching
         normalized_cmd = command_type.upper()
 
