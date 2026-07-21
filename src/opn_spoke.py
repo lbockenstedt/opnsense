@@ -1,5 +1,6 @@
 import logging
 import subprocess
+import time
 from typing import Dict, Any
 from core.src.base_spoke import BaseSpoke
 from opnsense_engine import OpnsenseEngine
@@ -49,6 +50,14 @@ class OpnSpoke(BaseSpoke):
 
         # Caching and Scheduling
         self._cache = {}
+        # Per-key store timestamp (epoch seconds) for TTL-bounded reads. The
+        # persistent read-cache is refreshed by the 1h loop AND filled by every
+        # live read (_cache_live); without a TTL, handle_command served whatever
+        # was last stored — up to 1h stale after an add/delete. Reads are now
+        # capped at _cache_ttl (like DHCP leases, which are served live) and
+        # write handlers pop the affected GET keys for immediate freshness.
+        self._cache_ts = {}
+        self._cache_ttl = config.get("cache_ttl", 60)  # seconds; cap read staleness
         self._refresh_interval = config.get("refresh_interval", 3600) # seconds, default 1h
         self._refresh_task = None
 
@@ -122,6 +131,7 @@ class OpnSpoke(BaseSpoke):
                 # Only cache if the result was a success
                 if isinstance(res, dict) and res.get("status") == "SUCCESS":
                     self._cache[cmd] = res
+                    self._cache_ts[cmd] = time.time()
                     results[cmd] = "OK"
                 else:
                     results[cmd] = f"Error: {res.get('message') if isinstance(res, dict) else res}"
@@ -137,6 +147,26 @@ class OpnSpoke(BaseSpoke):
         refresh_cache). Best-effort: returns ``res`` unchanged regardless."""
         if isinstance(res, dict) and res.get("status") == "SUCCESS":
             self._cache[cmd] = res
+            self._cache_ts[cmd] = time.time()
+        return res
+
+    def _cache_get_fresh(self, key: str):
+        """Return the cached value for ``key`` only if present AND younger than
+        ``_cache_ttl``; otherwise ``None`` (caller should fetch live). Bounds how
+        stale a read can be — the refresh loop (1h) and _cache_live populate the
+        cache, and without this the read served arbitrarily old data."""
+        if key in self._cache and (time.time() - self._cache_ts.get(key, 0)) < self._cache_ttl:
+            return self._cache[key]
+        return None
+
+    def _invalidate_on_write(self, res: Dict[str, Any], keys) -> Dict[str, Any]:
+        """After a successful write, drop the cached GET responses it affects so
+        the next read re-fetches live instead of serving the pre-change list for
+        up to the refresh interval. Best-effort: returns ``res`` unchanged."""
+        if isinstance(res, dict) and res.get("status") == "SUCCESS":
+            for k in keys:
+                self._cache.pop(k, None)
+                self._cache_ts.pop(k, None)
         return res
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -233,9 +263,13 @@ class OpnSpoke(BaseSpoke):
             "OPNSENSE_GET_ALIASES": "aliases",
         }
 
-        if normalized_cmd in cache_map and normalized_cmd in self._cache:
-            logger.debug(f"Returning cached data for {normalized_cmd}")
-            return self._cache[normalized_cmd]
+        if normalized_cmd in cache_map:
+            fresh = self._cache_get_fresh(normalized_cmd)
+            if fresh is not None:
+                logger.debug(f"Returning cached data for {normalized_cmd}")
+                return fresh
+            # Stale or cold → fall through to the live fetch below (which
+            # re-caches via _cache_live). Nothing older than _cache_ttl is served.
 
         if normalized_cmd == "PROBE_API":
             path = data.get("path")
@@ -245,7 +279,9 @@ class OpnSpoke(BaseSpoke):
 
         if normalized_cmd == "OPNSENSE_UPDATE_ALIAS":
             # Data expected: {"name": "web_servers", "hosts": ["1.1.1.1", "2.2.2.2"]}
-            return await self.engine.manage_alias(data.get("name"), data.get("hosts"), action="update")
+            return self._invalidate_on_write(
+                await self.engine.manage_alias(data.get("name"), data.get("hosts"), action="update"),
+                ["OPNSENSE_GET_ALIASES"])
 
         elif normalized_cmd == "GET_INTERFACE_STATUS":
             return self._cache_live(normalized_cmd, await self.engine.get_interface_status())
@@ -260,7 +296,7 @@ class OpnSpoke(BaseSpoke):
             # loop, so a per-IP lookup was paying a full ruleset round-trip
             # for nothing. Fall back to a live fetch if the cache is cold.
             ip = data.get("ip", "")
-            cached_rules = self._cache.get("OPNSENSE_GET_ALL_RULES")
+            cached_rules = self._cache_get_fresh("OPNSENSE_GET_ALL_RULES")
             if cached_rules and cached_rules.get("status") == "SUCCESS":
                 rules = cached_rules.get("data", [])
                 if not isinstance(rules, list):
@@ -308,77 +344,85 @@ class OpnSpoke(BaseSpoke):
             return self._cache_live(normalized_cmd, await self.engine.get_all_aliases())
 
         elif normalized_cmd == "OPNSENSE_ADD_ALIAS":
-            return await self.engine.add_alias(
+            return self._invalidate_on_write(await self.engine.add_alias(
                 data.get("name", ""),
                 data.get("type", "host"),
                 data.get("content", ""),
                 data.get("description", ""),
                 data.get("category", "")
-            )
+            ), ["OPNSENSE_GET_ALIASES"])
 
         elif normalized_cmd == "OPNSENSE_DEL_ALIAS":
-            return await self.engine.delete_alias(data.get("uuid", ""))
+            return self._invalidate_on_write(
+                await self.engine.delete_alias(data.get("uuid", "")),
+                ["OPNSENSE_GET_ALIASES"])
 
         elif normalized_cmd == "OPNSENSE_ADD_RULE":
-            return await self.engine.add_firewall_rule_and_apply(data.get("rule", {}))
+            return self._invalidate_on_write(
+                await self.engine.add_firewall_rule_and_apply(data.get("rule", {})),
+                ["OPNSENSE_GET_ALL_RULES", "OPNSENSE_GET_RULES_BY_IP"])
 
         elif normalized_cmd == "OPNSENSE_DEL_RULE":
-            return await self.engine.delete_firewall_rule_and_apply(data.get("rule_id", ""))
+            return self._invalidate_on_write(
+                await self.engine.delete_firewall_rule_and_apply(data.get("rule_id", "")),
+                ["OPNSENSE_GET_ALL_RULES", "OPNSENSE_GET_RULES_BY_IP"])
 
         elif normalized_cmd == "OPNSENSE_ADD_NAT_RULE":
-            return await self.engine.add_nat_rule(
+            return self._invalidate_on_write(await self.engine.add_nat_rule(
                 data.get("nat_type", "d_nat"),
                 data.get("rule", {})
-            )
+            ), ["OPNSENSE_GET_NAT_POLICIES"])
 
         elif normalized_cmd == "OPNSENSE_DEL_NAT_RULE":
-            return await self.engine.delete_nat_rule(
+            return self._invalidate_on_write(await self.engine.delete_nat_rule(
                 data.get("nat_type", "d_nat"),
                 data.get("uuid", "")
-            )
+            ), ["OPNSENSE_GET_NAT_POLICIES"])
 
         elif normalized_cmd == "OPNSENSE_ADD_DNS_RECORD":
-            return await self.engine.add_dns_record(
+            return self._invalidate_on_write(await self.engine.add_dns_record(
                 data.get("hostname", ""),
                 data.get("domain", ""),
                 data.get("ip", ""),
                 data.get("description", "")
-            )
+            ), ["OPNSENSE_GET_DNS_RECORDS"])
 
         elif normalized_cmd == "OPNSENSE_DEL_DNS_RECORD":
-            return await self.engine.delete_dns_record(data.get("uuid", ""))
+            return self._invalidate_on_write(
+                await self.engine.delete_dns_record(data.get("uuid", "")),
+                ["OPNSENSE_GET_DNS_RECORDS"])
 
         elif normalized_cmd == "OPNSENSE_EDIT_RULE":
-            return await self.engine.edit_firewall_rule(
+            return self._invalidate_on_write(await self.engine.edit_firewall_rule(
                 data.get("uuid", ""),
                 data.get("rule", {})
-            )
+            ), ["OPNSENSE_GET_ALL_RULES", "OPNSENSE_GET_RULES_BY_IP"])
 
         elif normalized_cmd == "OPNSENSE_EDIT_ALIAS":
-            return await self.engine.edit_alias(
+            return self._invalidate_on_write(await self.engine.edit_alias(
                 data.get("uuid", ""),
                 data.get("name", ""),
                 data.get("type", "host"),
                 data.get("content", ""),
                 data.get("description", ""),
                 data.get("category", "")
-            )
+            ), ["OPNSENSE_GET_ALIASES"])
 
         elif normalized_cmd == "OPNSENSE_EDIT_NAT_RULE":
-            return await self.engine.edit_nat_rule(
+            return self._invalidate_on_write(await self.engine.edit_nat_rule(
                 data.get("nat_type", "d_nat"),
                 data.get("uuid", ""),
                 data.get("rule", {})
-            )
+            ), ["OPNSENSE_GET_NAT_POLICIES"])
 
         elif normalized_cmd == "OPNSENSE_EDIT_DNS_RECORD":
-            return await self.engine.edit_dns_record(
+            return self._invalidate_on_write(await self.engine.edit_dns_record(
                 data.get("uuid", ""),
                 data.get("hostname", ""),
                 data.get("domain", ""),
                 data.get("ip", ""),
                 data.get("description", "")
-            )
+            ), ["OPNSENSE_GET_DNS_RECORDS"])
 
         elif normalized_cmd in ("INSTALL_CERT", "OPNSENSE_INSTALL_CERT"):
             # NOTE: the hub (cert_distribution.py) pushes a BARE ``INSTALL_CERT``

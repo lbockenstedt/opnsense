@@ -498,7 +498,13 @@ class OpnsenseEngine:
         (clears the alias's categories on edit)."""
         if not category or not str(category).strip():
             return ""
-        cat_map = await self._alias_category_map()
+        # Bypass the 5-min memo here (invalidate=True): this runs on the alias
+        # add/edit write path, where the category may have been created moments
+        # ago (by the same UI action or an out-of-band API call). A stale memo
+        # wouldn't contain the new category UUID, so the name would fail to
+        # resolve and be silently DROPPED (see the warn below). Fetching live
+        # ensures a just-created category resolves and refreshes the memo.
+        cat_map = await self._alias_category_map(invalidate=True)
         name_to_uuid = {name: uuid for uuid, name in cat_map.items()}
         uuids: List[str] = []
         for name in [n.strip() for n in str(category).split(",") if n.strip()]:
