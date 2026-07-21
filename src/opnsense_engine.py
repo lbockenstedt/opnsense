@@ -926,3 +926,187 @@ class OpnsenseEngine:
             return {"status": "SUCCESS", "data": arp}
 
         return {"status": "ERROR", "message": "Unexpected ARP API response format"}
+
+    # ------------------------------------------------------------------
+    # DHCP global-search helpers (tenant-scoped)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_mac(raw: str) -> str:
+        """Normalize a MAC to lower-colon form (aa:bb:cc:dd:ee:ff).
+
+        Accepts the common variants (``aa:bb:cc:dd:ee:ff``, ``aa-bb-...``,
+        ``aabb.ccdd.eeff``, bare ``aabbccddeeff``). If the cleaned hex isn't
+        12 chars, return the stripped lowercased input unchanged so partial
+        fragments (e.g. ``aa:bb``) still flow through substring matching.
+        """
+        if not raw:
+            return ""
+        s = re.sub(r"[^0-9a-fA-F]", "", raw or "").lower()
+        if len(s) != 12:
+            return (raw or "").strip().lower()
+        return ":".join(s[i:i + 2] for i in range(0, 12, 2))
+
+    @staticmethod
+    def _ip_in_prefixes(ip_str: str, prefixes: List[str]) -> bool:
+        """True if ``ip_str`` (v4 or v6) falls within any CIDR in ``prefixes``.
+
+        Bad CIDRs / IPs are silently skipped (never raise) — a malformed
+        tenant prefix must not blank out the whole search.
+        """
+        import ipaddress
+        if not ip_str or not prefixes:
+            return False
+        try:
+            addr = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        for cidr in prefixes:
+            try:
+                if addr in ipaddress.ip_network(cidr, strict=False):
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    async def get_dhcp_static_mappings(self) -> Dict[str, Any]:
+        """Fetch DHCPv4 static mappings (reservations) from the Kea DHCP server.
+
+        Complements :meth:`get_dhcp_leases` for the global-search path. The
+        Kea plugin exposes reservations at ``/api/kea/dhcp4/searchReserved``;
+        row field names are hyphenated (``ip-address``/``hw-address``) but we
+        fall back to the dynamic-lease names too so a schema drift doesn't
+        drop every reservation. Returns ``{id, ip, mac, hostname}`` rows.
+        """
+        res = await self._request("GET", "/api/kea/dhcp4/searchReserved")
+
+        if isinstance(res, dict):
+            # Same ERROR-envelope classification as get_dhcp_leases — an API
+            # blip must not read as SUCCESS+[] (search would silently miss
+            # all reservations).
+            if res.get("status") == "ERROR" or "error" in res or "errorMessage" in res:
+                return {"status": "ERROR", "details": res}
+            rows = res.get("rows")
+            if rows is None:
+                rows = res.get("data")
+            if rows is None:
+                logger.info(f"Kea reservations API returned success but no rows. Response: {res}")
+                return {"status": "SUCCESS", "data": [], "source": "empty"}
+            if isinstance(rows, dict):
+                rows = list(rows.values())
+            if not isinstance(rows, list):
+                rows = []
+
+            mappings = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                ip = (row.get("ip-address") or row.get("address") or row.get("ip") or "").strip()
+                mac = (row.get("hw-address") or row.get("hwaddr") or row.get("mac") or "").strip()
+                host = (row.get("hostname") or row.get("host") or "").strip()
+                if not ip and not mac:
+                    continue
+                mappings.append({
+                    "id": (row.get("uuid") or ip or "").strip(),
+                    "ip": ip or "unknown",
+                    "mac": mac or "unknown",
+                    "hostname": host or "unknown",
+                })
+            return {"status": "SUCCESS", "data": mappings}
+
+        return {"status": "ERROR", "message": "Unexpected API response format"}
+
+    async def search_dhcp(self, q: str,
+                          prefixes: Optional[List[str]] = None,
+                          is_admin: bool = False) -> Dict[str, Any]:
+        """Tenant-scoped DHCP search across dynamic leases AND static mappings.
+
+        Matches ``q`` against lease IP, hostname, and MAC. The hub normalizes
+        a MAC query to lower-colon form before sending; we re-normalize here
+        (idempotent) and also compare against the normalized lease MAC so
+        ``aa:bb:cc:dd:ee:ff`` matches ``aabb.ccdd.eeff``.
+
+        Prefix scoping (enforced spoke-side, never trusts the hub filter):
+          * ``prefixes`` non-empty  → only results whose IP is in one CIDR;
+          * ``prefixes`` empty + ``is_admin`` True  → unscoped (all leases);
+          * ``prefixes`` empty + ``is_admin`` False → EMPTY (never leak
+            another tenant's leases).
+
+        Returns ``{status, results, count}`` where each result dict carries
+        at minimum ``source``, ``type``, ``name``, ``ip``, ``mac``.
+        """
+        try:
+            q_low = (q or "").strip().lower()
+            q_mac = self._normalize_mac(q or "")
+            has_prefixes = bool(prefixes)
+
+            def _matches(ip: str, host: str, mac: str) -> bool:
+                if not q_low:
+                    return False
+                mac_norm = self._normalize_mac(mac)
+                return (q_low in (ip or "").lower() or
+                        q_low in (host or "").lower() or
+                        (bool(q_mac) and q_mac == mac_norm) or
+                        q_low in mac_norm)
+
+            def _in_scope(ip_str: str) -> bool:
+                if has_prefixes:
+                    return self._ip_in_prefixes(ip_str, prefixes or [])
+                # No prefixes: admin sees everything, non-admin sees nothing.
+                return bool(is_admin)
+
+            results: List[Dict[str, Any]] = []
+
+            # --- dynamic leases ---
+            try:
+                leases_r = await self.get_dhcp_leases()
+                if leases_r.get("status") == "SUCCESS":
+                    for lease in leases_r.get("data", []):
+                        ip = lease.get("ip", "") or ""
+                        host = lease.get("hostname", "") or ""
+                        mac = lease.get("mac", "") or ""
+                        if not _matches(ip, host, mac):
+                            continue
+                        if not _in_scope(ip):
+                            continue
+                        results.append({
+                            "source": "opnsense",
+                            "type": "dhcp_lease",
+                            "id": ip,
+                            "name": host if host and host != "unknown" else ip,
+                            "ip": ip,
+                            "mac": self._normalize_mac(mac),
+                            "state": "active",
+                            "lease_end": lease.get("lease_end", ""),
+                        })
+            except Exception as e:
+                logger.warning(f"search_dhcp dynamic-leases leg failed: {e}")
+
+            # --- static mappings (reservations) ---
+            try:
+                static_r = await self.get_dhcp_static_mappings()
+                if static_r.get("status") == "SUCCESS":
+                    for sm in static_r.get("data", []):
+                        ip = sm.get("ip", "") or ""
+                        host = sm.get("hostname", "") or ""
+                        mac = sm.get("mac", "") or ""
+                        if not _matches(ip, host, mac):
+                            continue
+                        if not _in_scope(ip):
+                            continue
+                        results.append({
+                            "source": "opnsense",
+                            "type": "dhcp_static",
+                            "id": sm.get("id") or ip,
+                            "name": host if host and host != "unknown" else ip,
+                            "ip": ip,
+                            "mac": self._normalize_mac(mac),
+                            "state": "reserved",
+                        })
+            except Exception as e:
+                logger.warning(f"search_dhcp static-mappings leg failed: {e}")
+
+            return {"status": "SUCCESS", "results": results, "count": len(results)}
+        except Exception as e:
+            logger.exception("search_dhcp failed")
+            return {"status": "ERROR", "message": f"DHCP search failed: {e}"}

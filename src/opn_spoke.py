@@ -442,26 +442,18 @@ class OpnSpoke(BaseSpoke):
             )
 
         elif normalized_cmd == "SEARCH_DHCP":
-            # Search DHCP leases by IP, MAC, or hostname fragment
-            q = data.get("q", "").strip().lower()
-            leases_r = await self.engine.get_dhcp_leases()
-            if leases_r.get("status") != "SUCCESS":
-                return {"status": "SUCCESS", "results": [], "count": 0}
-            matches = []
-            for lease in leases_r.get("data", []):
-                if (q in (lease.get("ip") or "").lower() or
-                        q in (lease.get("mac") or "").lower() or
-                        q in (lease.get("hostname") or "").lower()):
-                    matches.append({
-                        "source":   "opnsense",
-                        "type":     "dhcp_lease",
-                        "name":     lease.get("hostname", ""),
-                        "ip":       lease.get("ip", ""),
-                        "mac":      lease.get("mac", ""),
-                        "lease_end": lease.get("lease_end", ""),
-                        "id":       lease.get("ip", ""),
-                    })
-            return {"status": "SUCCESS", "results": matches, "count": len(matches)}
+            # Tenant-scoped DHCP search across dynamic leases AND static
+            # reservations. The hub normalizes ``q`` (MAC → lower-colon) and
+            # sends ``prefixes`` + ``is_admin``; scoping is enforced
+            # engine-side (see OpnsenseEngine.search_dhcp). We only forward
+            # the contract fields — never filter spoke-side, never trust the
+            # hub to have pre-filtered.
+            q = data.get("q", "").strip()
+            return await self.engine.search_dhcp(
+                q,
+                prefixes=data.get("prefixes") or [],
+                is_admin=bool(data.get("is_admin")),
+            )
 
         else:
             if command_type in _SYSTEM_COMMANDS:
