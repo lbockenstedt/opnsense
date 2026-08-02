@@ -12,9 +12,14 @@ Sources: New Central — developer.arubanetworks.com "Making API Calls".
 Classic — `CLUSTER_API_BASE_URL_LIST` in [aruba/pycentral](https://github.com/aruba/pycentral/blob/master/pycentral/constants.py),
 which is what the client library actually dials. HPE's own doc pages return 403.
 
-> Pulling this into an OPNsense **URL Table alias** will not work — that parser
-> expects one bare host or network per line and will choke on Markdown. Use
-> [`aruba-central-urls.txt`](aruba-central-urls.txt) beside this file for that.
+> **Using these in OPNsense:** a `URL Table (IPs)` alias accepts only IP
+> addresses, CIDR and ranges — it will NOT resolve hostnames, and there is no
+> alias type that fetches a list of FQDNs from a URL
+> ([opnsense/core#1482](https://github.com/opnsense/core/issues/1482) is still
+> open). Use a **`Host(s)`** alias and paste the names in: OPNsense re-resolves
+> them via the system resolver every 300s (configurable) and populates the pf
+> table with every address returned. [`aruba-central-urls.txt`](aruba-central-urls.txt)
+> is the paste-ready list, one FQDN per line.
 
 ---
 
@@ -140,7 +145,7 @@ https://apigw-uaenorth1.central.arubanetworks.com
 curl -fsSL https://raw.githubusercontent.com/lbockenstedt/opnsense/main/docs/aruba-central-urls.md
 ```
 
-Bare hostnames (no scheme) for an OPNsense URL Table alias:
+Bare hostnames, one per line — paste into a `Host(s)` alias:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/lbockenstedt/opnsense/main/docs/aruba-central-urls.txt
