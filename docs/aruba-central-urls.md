@@ -1,6 +1,6 @@
-# Aruba Central API URLs
+# Aruba Central URLs
 
-Every known HPE Aruba Networking Central API base URL, for firewall rules,
+Every known HPE Aruba Networking Central endpoint — API, device, provisioning and services, for firewall rules,
 allow-lists, and connector configuration.
 
 There are **two entirely separate schemes** and they do not map onto each other.
@@ -136,6 +136,73 @@ https://apigw-apaceast.central.arubanetworks.com
 https://apigw-apacsouth.central.arubanetworks.com
 https://apigw-uaenorth1.central.arubanetworks.com
 ```
+
+---
+
+## Device, provisioning and service endpoints
+
+The API base URLs above are only what an *API client* needs. Devices and the
+platform itself reach considerably more. These are the firewall/proxy allow-list
+entries from the "Opening Firewall Ports for Device Communication" tables.
+
+**Provenance:** HPE's own doc pages return 403 or reset the connection to
+automated fetches, so these came from a documentation mirror. Treat the set as
+thorough but NOT guaranteed exhaustive -- new cluster zones appear over time,
+and a region you use may have a `device-*` host not listed here. The
+authoritative per-tenant answer is in Central under the cluster-zone / API
+Gateway pages.
+
+### Device communication (Classic clusters) — TCP 443
+
+| Host | Notes |
+|---|---|
+| `app1.central.arubanetworks.com` | US-1 |
+| `device-prod2.central.arubanetworks.com` | US-2 |
+| `device-uswest4.central.arubanetworks.com` | US-West4 |
+| `device-eu.central.arubanetworks.com` | EU-1 |
+| `device-eucentral3.central.arubanetworks.com` | EU-Central3 |
+| `device-ca.central.arubanetworks.com` | Canada-1 |
+| `device.central.arubanetworks.com.cn` | China-1 |
+| `app1-ap.central.arubanetworks.com` | APAC-1 |
+| `device-apaceast.central.arubanetworks.com` | APAC-East1 |
+| `device-apacsouth.central.arubanetworks.com` | APAC-South1 |
+| `device-uaenorth1.central.arubanetworks.com` | UAE-North1 |
+
+### AOS-CX device communication (`-d2`) — TCP 443
+
+`device-prod2-d2` · `device-uswest4-d2` · `device-eucentral3-d2` ·
+`device-uaenorth1-d2` (all `.central.arubanetworks.com`)
+
+### Activate / provisioning — TCP 443
+
+| Host | Purpose |
+|---|---|
+| `device.arubanetworks.com` | Activate device provisioning |
+| `devices-v2.arubanetworks.com` | Activate v2 |
+| `activate.arubanetworks.com` | Activate |
+| `est.arubanetworks.com` | EST certificate provisioning |
+
+### Platform services
+
+| Host | Purpose | Ports |
+|---|---|---|
+| `rcs-ng-prod.central.arubanetworks.com` | Remote Configuration Service | 443 (SSH) |
+| `rcs-ng-xp-prod.central.arubanetworks.com` | RCS | 443 (SSH) |
+| `naw2.cloudguest.central.arubanetworks.com` | CloudGuest | 443, 2083 |
+| `common.cloud.hpe.com` | HPE GreenLake / firmware registry | 80, 443 |
+| `d20kce0f6gvxjn.cloudfront.net` | Firmware/software delivery CDN | 443 |
+| `stun.pqm.arubanetworks.com` | STUN (path quality) | 3478-3479 |
+| `pqm.arubanetworks.com` | Path quality monitoring | ICMP, 4500 |
+| `pool.ntp.org` | NTP | UDP 123 |
+
+### Web Content Classification (BrightCloud)
+
+`aruba.brightcloud.com` · `bcap15-dualstack.brightcloud.com` ·
+`api-dualstack.bcti.brightcloud.com` · `database-dualstack.brightcloud.com` — TCP 443
+
+> `pool.ntp.org` and the BrightCloud/CloudFront hosts are third-party, not
+> Aruba-operated. Include them only if you actually run those features — NTP via
+> the pool and WebCC classification respectively.
 
 ---
 
