@@ -43,9 +43,9 @@ def _make_engine(responses):
     eng = OpnsenseEngine(host="fw:8443", api_key="k", api_secret="s")
     calls = []
 
-    async def fake_request(method, endpoint, data=None):
+    async def fake_request(method, endpoint, data=None, timeout=15):
         base = endpoint.split("?", 1)[0]
-        calls.append({"method": method, "endpoint": base, "data": data})
+        calls.append({"method": method, "endpoint": base, "data": data, "timeout": timeout})
         return responses.get(base, {"status": "ERROR", "message": "not found"})
 
     eng._request = fake_request
@@ -229,3 +229,43 @@ def test_split_leaf_cert_returns_only_first_block():
     assert OpnsenseEngine._split_leaf_cert(_LEAF) == _LEAF
     assert OpnsenseEngine._split_leaf_cert("") == ""
     assert OpnsenseEngine._split_leaf_cert("no pem here") == ""
+
+def test_import_cert_uses_extended_timeout_for_writes():
+    """Cert + CA import POST large PEM payloads and the firewall persists them
+    slowly, so those write calls must pass the longer curl --max-time
+    (_CERT_IMPORT_TIMEOUT), not the 15s default — otherwise a slow-but-
+    succeeding import is cut off as curl exit 28."""
+    eng, calls = _make_engine({
+        "/api/trust/ca/search": {"rows": []},
+        "/api/trust/ca/add": {"status": "saved"},
+        "/api/trust/cert/search": {"rows": []},
+        "/api/trust/cert/add": {"status": "saved"},
+    })
+    res = _run(eng.import_cert("fw.example.com", _FULLCHAIN, _KEY))
+    assert res["status"] == "SUCCESS"
+    for suffix in ("/api/trust/ca/add", "/api/trust/cert/add"):
+        c = _cert_call(calls, suffix)
+        assert c is not None, f"{suffix} not called"
+        assert c["timeout"] == OpnsenseEngine._CERT_IMPORT_TIMEOUT
+
+
+def test_request_timeout_reports_clear_message(monkeypatch):
+    """A curl exit 28 (operation timed out) with empty stderr must surface an
+    explicit timeout message including the budget — not a bare 'Curl failed with
+    code 28' — so a slow firewall is diagnosable."""
+    eng = OpnsenseEngine(host="fw:8443", api_key="k", api_secret="s")
+
+    class _FakeProc:
+        returncode = 28
+
+        async def communicate(self):
+            return (b"", b"")
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    res = _run(eng._request("POST", "/api/trust/cert/add", data={"cert": {}}, timeout=60))
+    assert res["status"] == "ERROR"
+    assert "timed out" in res["message"].lower()
+    assert "60" in res["message"]

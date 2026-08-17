@@ -12,6 +12,11 @@ class OpnsenseEngine:
     Core interaction layer for the OPNsense API.
     Handles Firewall rule management and Interface monitoring.
     """
+    # Cert/CA imports POST large PEM payloads and the firewall persists them to
+    # the trust store (slower than a rule read), so give those calls a longer
+    # curl --max-time than the 15s default to avoid a spurious timeout (curl 28).
+    _CERT_IMPORT_TIMEOUT = 60
+
     def __init__(self, host: Optional[str], api_key: Optional[str], api_secret: Optional[str]):
         self.host = host
         self.api_key = api_key
@@ -42,9 +47,15 @@ class OpnsenseEngine:
                            "credentials via the OPNsense connection settings; "
                            "skipping API calls until then.")
 
-    async def _request(self, method: str, endpoint: str, data: Dict = None) -> Dict[str, Any]:
+    async def _request(self, method: str, endpoint: str, data: Dict = None,
+                       timeout: int = 15) -> Dict[str, Any]:
         """Internal helper to handle OPNsense API requests using system curl.
         Bypasses Python network stack issues that cause ConnectError while system curl works.
+
+        ``timeout`` is curl's total ``--max-time`` (seconds). The default (15) suits
+        the small read/rule calls, but cert/CA imports POST large PEM payloads and
+        the firewall can take longer to persist them — those callers pass a larger
+        value so a slow-but-succeeding import isn't cut off at 15s (curl exit 28).
         """
         import json
         import asyncio
@@ -64,7 +75,14 @@ class OpnsenseEngine:
 
         # Lab firewalls use self-signed certs by default. Skip TLS verification
         # unless LM_OPNSENSE_VERIFY_TLS=1 is explicitly set in the environment.
-        cmd = ["curl", "-s", "--max-time", "15"]
+        # -sS: silent progress but STILL surface errors on stderr, so a timeout
+        # (curl 28) or TLS error yields a real message instead of an empty one.
+        # --connect-timeout bounds the TCP/TLS handshake separately from the
+        # overall --max-time so an unreachable host fails fast without eating the
+        # whole (possibly long) import budget.
+        connect_timeout = min(10, timeout)
+        cmd = ["curl", "-sS", "--connect-timeout", str(connect_timeout),
+               "--max-time", str(timeout)]
         if os.getenv("LM_OPNSENSE_VERIFY_TLS") != "1":
             cmd.append("-k")
         cmd.extend([
@@ -87,7 +105,13 @@ class OpnsenseEngine:
             stdout, stderr = await process.communicate()
 
             if process.returncode != 0:
-                error_msg = stderr.decode().strip() or f"Curl failed with code {process.returncode}"
+                # curl 28 = operation timed out. Make it explicit (and include the
+                # budget) because -s used to swallow it into a bare "code 28".
+                if process.returncode == 28:
+                    error_msg = (stderr.decode().strip()
+                                 or f"request timed out after {timeout}s (curl 28)")
+                else:
+                    error_msg = stderr.decode().strip() or f"Curl failed with code {process.returncode}"
                 logger.error(f"Curl request failed for {url}: {error_msg}")
                 return {"status": "ERROR", "message": error_msg}
 
@@ -710,11 +734,13 @@ class OpnsenseEngine:
         existing_uuid = await self._find_cert_uuid(domain or "")
         if existing_uuid:
             res = await self._request("POST", f"/api/trust/cert/set/{existing_uuid}",
-                                      data={"cert": cert_payload})
+                                      data={"cert": cert_payload},
+                                      timeout=self._CERT_IMPORT_TIMEOUT)
             action = "updated"
         else:
             res = await self._request("POST", "/api/trust/cert/add",
-                                      data={"cert": cert_payload})
+                                      data={"cert": cert_payload},
+                                      timeout=self._CERT_IMPORT_TIMEOUT)
             action = "added"
         if isinstance(res, dict) and res.get("status") == "ERROR":
             # Surface the CA import results alongside so a "missing CA key" leaf
@@ -736,11 +762,13 @@ class OpnsenseEngine:
         uuid = await self._find_ca_uuid(descr)
         if uuid:
             res = await self._request("POST", f"/api/trust/ca/set/{uuid}",
-                                      data={"ca": payload})
+                                      data={"ca": payload},
+                                      timeout=self._CERT_IMPORT_TIMEOUT)
             action = "updated"
         else:
             res = await self._request("POST", "/api/trust/ca/add",
-                                      data={"ca": payload})
+                                      data={"ca": payload},
+                                      timeout=self._CERT_IMPORT_TIMEOUT)
             action = "added"
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
