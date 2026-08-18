@@ -22,11 +22,11 @@ A brand-new firewall entry has **no live connection** until its host/port/API ke
 
 ## Ports / backends
 
-OPNsense REST over HTTPS at `https://{host}:{port}` (`OpnsenseEngine`). Default `localhost:8443`. TLS verify **disabled** unless `LM_OPNSENSE_VERIFY_TLS=1`. No port served. Endpoints: `/api/interfaces/overview/interfaces_info`, `/api/diagnostics/systemhealth/get_system_health`, `/api/firewall/filter/*` (add/del/search/setRule/apply), `/api/firewall/alias/*` (+ `listCategories`), `/api/firewall/d_nat|source_nat|one_to_one/*`, `/api/unbound/settings/*` + `/api/unbound/service/reconfigure`, `/api/trust/cert/*`, `/api/kea/leases4/search` (DHCP), `/api/diagnostics/interface/search_arp` (ARP).
+OPNsense REST over HTTPS at `https://{host}:{port}` (`OpnsenseEngine`). Default `localhost:8443`. TLS verify **enabled** by default; set `LM_OPNSENSE_VERIFY_TLS=0`/`false` only for trusted lab self-signed endpoints. No port served. Endpoints: `/api/interfaces/overview/interfaces_info`, `/api/diagnostics/systemhealth/get_system_health`, `/api/firewall/filter/*` (add/del/search/setRule/apply), `/api/firewall/alias/*` (+ `listCategories`), `/api/firewall/d_nat|source_nat|one_to_one/*`, `/api/unbound/settings/*` + `/api/unbound/service/reconfigure`, `/api/trust/cert/*`, `/api/kea/leases4/search` (DHCP), `/api/diagnostics/interface/search_arp` (ARP).
 
 ## Environment variables
 
-`SPOKE_ID`, `SPOKE_SECRET`, `HUB_SECRET`, `HUB_URL`; `LM_OPNSENSE_VERIFY_TLS` (engine). Connection config (`opn_host`/`opn_port`/`api_key`/`api_secret`/`refresh_interval`) is **not** env-read at boot — the hub pushes it via `UPDATE_CONFIG`; `__init__` starts `config={}`.
+`SPOKE_ID`, `SPOKE_SECRET`, `HUB_SECRET`, `HUB_URL`; `LM_OPNSENSE_VERIFY_TLS` (engine, defaults to verified TLS; `0`/`false` disables verification with a warning). Connection config (`opn_host`/`opn_port`/`api_key`/`api_secret`/`refresh_interval`) is **not** env-read at boot — the hub pushes it via `UPDATE_CONFIG`; `__init__` starts `config={}`.
 
 ## Install flags
 
@@ -87,7 +87,7 @@ OPNsense REST over HTTPS at `https://{host}:{port}` (`OpnsenseEngine`). Default 
 - **DHCP Leases tab is empty even though clients are online.** Leases are always read live (never cached), so an empty tab reflects what OPNsense's Kea DHCP server currently reports, not a stale cache. Check that Kea (not dnsmasq — OPNsense's DHCP backend here is Kea, exposed at `/api/kea/leases4/search`) actually has active leases on that firewall, and that the API credentials have permission to read them.
 - **NAT Policies tab is empty or shows a warning.** OPNsense's NAT REST controllers used here need **OPNsense 26.1 or newer**; on an older firewall the probe against all three NAT endpoints (destination/source/1:1) fails and the tab reports the version requirement instead of silently showing nothing. A partial result (some NAT types worked, others didn't) shows the rules that did work plus a warning for the ones that didn't.
 - **An alias lost its category / category doesn't show up.** Category names are matched against OPNsense's existing alias categories by exact name; a name that doesn't exist on that firewall is dropped rather than auto-created. Check the category name for typos, or create the category on the firewall first.
-- **Is the connection to the firewall encrypted/verified?** Yes over HTTPS, but certificate verification is **off by default** (OPNsense's default self-signed cert would otherwise fail every call) — set `LM_OPNSENSE_VERIFY_TLS=1` in the module's environment if the target firewall has a trusted certificate and you want strict verification.
+- **Is the connection to the firewall encrypted/verified?** Yes over HTTPS, with certificate verification **on by default**. For trusted lab/self-signed firewalls, set `LM_OPNSENSE_VERIFY_TLS=0` (or `false`) in the module environment to pass curl `-k`; the engine logs a visible warning whenever this insecure escape hatch is used.
 - **A change I made on the firewall directly isn't showing up.** Non-lease/ARP data is cached for up to `refresh_interval` (default 1 hour); either wait for the next scheduled refresh or trigger `OPNSENSE_REFRESH_CACHE` (an admin/diagnostic action) to force an immediate re-fetch.
 
 ## Related pages

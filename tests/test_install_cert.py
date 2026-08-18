@@ -269,3 +269,36 @@ def test_request_timeout_reports_clear_message(monkeypatch):
     assert res["status"] == "ERROR"
     assert "timed out" in res["message"].lower()
     assert "60" in res["message"]
+
+
+def test_request_keeps_credentials_out_of_curl_argv_by_default(monkeypatch):
+    eng = OpnsenseEngine(host="fw:8443", api_key="k", api_secret="s")
+    seen = {}
+
+    class _FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b'{"status":"ok"}', b"")
+
+    async def fake_exec(*args, **kwargs):
+        seen["args"] = args
+        cfg_path = args[args.index("--config") + 1]
+        seen["cfg_path"] = cfg_path
+        seen["cfg_mode"] = os.stat(cfg_path).st_mode & 0o777
+        with open(cfg_path, "r") as f:
+            seen["cfg_text"] = f.read()
+        return _FakeProc()
+
+    monkeypatch.delenv("LM_OPNSENSE_VERIFY_TLS", raising=False)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    res = _run(eng._request("GET", "/api/test"))
+
+    assert res == {"status": "ok"}
+    assert "-u" not in seen["args"]
+    assert "k:s" not in " ".join(seen["args"])
+    assert "-k" not in seen["args"]
+    assert seen["cfg_mode"] == 0o600
+    assert seen["cfg_text"] == 'user = "k:s"\n'
+    assert not os.path.exists(seen["cfg_path"])

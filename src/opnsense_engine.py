@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import tempfile
 import time
 import asyncio
 from typing import Dict, Any, List, Optional, Tuple
@@ -73,8 +74,8 @@ class OpnsenseEngine:
         url = f"https://{self.host}{endpoint}"
         logger.debug(f"Attempting API request to: {url}")
 
-        # Lab firewalls use self-signed certs by default. Skip TLS verification
-        # unless LM_OPNSENSE_VERIFY_TLS=1 is explicitly set in the environment.
+        # TLS verification is on by default. Lab firewalls with self-signed
+        # certificates can opt out with LM_OPNSENSE_VERIFY_TLS=0/false.
         # -sS: silent progress but STILL surface errors on stderr, so a timeout
         # (curl 28) or TLS error yields a real message instead of an empty one.
         # --connect-timeout bounds the TCP/TLS handshake separately from the
@@ -83,20 +84,32 @@ class OpnsenseEngine:
         connect_timeout = min(10, timeout)
         cmd = ["curl", "-sS", "--connect-timeout", str(connect_timeout),
                "--max-time", str(timeout)]
-        if os.getenv("LM_OPNSENSE_VERIFY_TLS") != "1":
+        verify_tls = os.getenv("LM_OPNSENSE_VERIFY_TLS", "1").strip().lower()
+        if verify_tls in {"0", "false", "no", "off"}:
+            logger.warning("LM_OPNSENSE_VERIFY_TLS=%s disables TLS certificate "
+                           "verification for OPNsense API requests; use only "
+                           "with trusted lab/self-signed endpoints.", verify_tls)
             cmd.append("-k")
-        cmd.extend([
-            "-u", f"{self.api_key}:{self.api_secret}",
-            "-X", method,
-            "-H", "Accept: application/json",
-        ])
-        # Only send Content-Type + body when there is a body — OPNsense returns
-        # "Invalid JSON syntax" if it sees Content-Type: application/json with no body.
-        if data is not None:
-            cmd.extend(["-H", "Content-Type: application/json", "-d", json.dumps(data)])
-        cmd.append(url)
-
+        auth_cfg_path = None
         try:
+            auth = f"{self.api_key}:{self.api_secret}"
+            auth = auth.replace("\\", "\\\\").replace('"', '\\"')
+            with tempfile.NamedTemporaryFile("w", prefix="lm-opnsense-curl-",
+                                             suffix=".conf", delete=False) as auth_cfg:
+                auth_cfg_path = auth_cfg.name
+                os.chmod(auth_cfg_path, 0o600)
+                auth_cfg.write(f'user = "{auth}"\n')
+            cmd.extend([
+                "--config", auth_cfg_path,
+                "-X", method,
+                "-H", "Accept: application/json",
+            ])
+            # Only send Content-Type + body when there is a body — OPNsense returns
+            # "Invalid JSON syntax" if it sees Content-Type: application/json with no body.
+            if data is not None:
+                cmd.extend(["-H", "Content-Type: application/json", "-d", json.dumps(data)])
+            cmd.append(url)
+
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -126,6 +139,12 @@ class OpnsenseEngine:
         except Exception as e:
             logger.exception(f"Exception during API request to {url}")
             return {"status": "ERROR", "message": str(e)}
+        finally:
+            if auth_cfg_path:
+                try:
+                    os.unlink(auth_cfg_path)
+                except OSError:
+                    pass
 
     async def get_interface_status(self) -> Dict[str, Any]:
         """Fetches current status of network interfaces."""
