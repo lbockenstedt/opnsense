@@ -1,3 +1,8 @@
+---
+summary: "Every known HPE Aruba Networking Central endpoint — API, device, provisioning and services, for firewall rules, allow-lists, and connector configuration."
+keywords: [aruba, central, classic, communication, device, opnsense, provisioning, tcp, urls]
+---
+
 # Aruba Central URLs
 
 Every known HPE Aruba Networking Central endpoint — API, device, provisioning and services, for firewall rules,

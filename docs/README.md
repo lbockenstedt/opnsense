@@ -1,3 +1,8 @@
+---
+summary: "Doc index for the opnsense repo: links to this module's feature reference and the shared LM architecture/topology page."
+keywords: [documentation, index, opnsense]
+---
+
 # opnsense — docs
 
 This repo carries a copy of its LM feature page plus the shared topology page:
