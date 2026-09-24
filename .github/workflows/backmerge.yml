@@ -235,7 +235,7 @@ jobs:
             case "$rollup" in
               *IN_PROGRESS*|*QUEUED*|*PENDING*|*WAITING*|*REQUESTED*)
                 sleep 10; continue ;;
-              *FAILURE*|*TIMED_OUT*|*CANCELLED*|*ACTION_REQUIRED*)
+              *FAILURE*|*TIMED_OUT*|*CANCELLED*|*ACTION_REQUIRED*|*ERROR*|*STALE*|*STARTUP_FAILURE*)
                 echo "::warning::#$NUM has failing checks ($rollup); leaving it open for a human"
                 exit 0 ;;
             esac
