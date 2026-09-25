@@ -66,8 +66,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Job-level, not workflow-level: workflow `concurrency` is evaluated before
-    # the matrix expands, so `matrix.target` is empty there and both targets
-    # would collapse into one queue (the qa run cancelling the dev run).
+    # the matrix expands, so `matrix.source` and `matrix.target` are empty there
+    # and runs would collapse into one queue.
     concurrency:
       group: backmerge-${{ matrix.source }}-to-${{ matrix.target }}
       cancel-in-progress: false
@@ -221,6 +221,7 @@ jobs:
           echo "auto-merge not armed: $(cat /tmp/automerge.err)"
 
           # Wait for the checks to settle before merging by hand.
+          settled=false
           for _ in $(seq 1 60); do
             state=$(gh pr view "$NUM" --json state -q .state)
             if [ "$state" = "MERGED" ]; then
@@ -234,12 +235,18 @@ jobs:
             case "$rollup" in
               *IN_PROGRESS*|*QUEUED*|*PENDING*|*WAITING*|*REQUESTED*)
                 sleep 10; continue ;;
-              *FAILURE*|*TIMED_OUT*|*CANCELLED*|*ACTION_REQUIRED*)
+              *FAILURE*|*TIMED_OUT*|*CANCELLED*|*ACTION_REQUIRED*|*ERROR*|*STALE*|*STARTUP_FAILURE*)
                 echo "::warning::#$NUM has failing checks ($rollup); leaving it open for a human"
                 exit 0 ;;
             esac
+            settled=true
             break
           done
+
+          if [ "$settled" != "true" ]; then
+            echo "::warning::#$NUM checks still pending after timeout; leaving it open for a human"
+            exit 0
+          fi
 
           if gh pr merge "$NUM" --merge --delete-branch; then
             echo "::notice::merged #$NUM into $TGT"
