@@ -268,6 +268,8 @@ jobs:
             if [ -n "$automation" ]; then
               printf -- '- This promotion changes **automation**, so it is not behaviour-neutral.\n'
               printf '  Workflow/script paths touched:\n\n%s\n' "$automation"
+            elif [ "$nfiles_ok" != "yes" ]; then
+              printf -- '- Whether workflow/script paths are touched is UNKNOWN (`git diff` failed).\n'
             else
               printf -- '- No workflow or shell-script paths are touched.\n'
             fi
