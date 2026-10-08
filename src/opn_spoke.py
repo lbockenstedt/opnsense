@@ -209,8 +209,13 @@ class OpnSpoke(BaseSpoke):
                 # Stay unconfigured (host=None) until a real host is supplied —
                 # never fall back to a localhost default.
                 self.engine.host = f"{host}:{port}" if host else None
-                self.engine.api_key = data.get("api_key", self.engine.api_key)
-                self.engine.api_secret = data.get("api_secret", self.engine.api_secret)
+                # Use `or` (not dict.get(key, default)) so a falsy/explicit-null
+                # api_key/api_secret in the payload can't silently wipe
+                # already-configured credentials — the spoke would then
+                # report "no firewall configured" again despite a prior
+                # successful UPDATE_CONFIG.
+                self.engine.api_key = data.get("api_key") or self.engine.api_key
+                self.engine.api_secret = data.get("api_secret") or self.engine.api_secret
 
             # Update refresh interval and restart loop if provided
             if "refresh_interval" in data:
