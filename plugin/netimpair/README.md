@@ -10,6 +10,27 @@ and a packet loss (%), Apply.
 
 ## Install
 
+### From the OPNsense GUI (recommended)
+
+Once per firewall, add this plugin's package repository (as root, from the
+console or **System > Diagnostics > Command Prompt** / SSH):
+
+```sh
+fetch -o /usr/local/etc/pkg/repos/netimpair.conf \
+  https://github.com/lbockenstedt/opnsense/releases/download/netimpair-repo/netimpair.conf
+```
+
+Then go to **System > Firmware > Plugins**, click **Check for updates**, find
+**os-netimpair** and click **+** to install. Updates and removal work from the
+same page like any other plugin. The page shows up under
+**Firewall > Shaper > Impairment** (reload the browser once).
+
+The repository is built by `.github/workflows/netimpair-pkg.yml` on every
+change to `main` and published on the `netimpair-repo` release. It is not
+signed, so `netimpair.conf` sets `signature_type: "none"`.
+
+### By hand
+
 Copy this folder to the OPNsense box and run, as root:
 
 ```sh
@@ -17,9 +38,8 @@ sh install.sh            # install or update
 sh install.sh --remove   # uninstall
 ```
 
-It can also be built as a real package from an
-[opnsense/plugins](https://github.com/opnsense/plugins) checkout (put it at
-`net/netimpair`, then `make package`).
+`build-pkg.sh <dir> <version>` builds the package and repository on any
+FreeBSD host.
 
 ## Use
 
