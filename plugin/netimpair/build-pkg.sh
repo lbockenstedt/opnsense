@@ -3,10 +3,10 @@
 # FreeBSD (needs pkg); CI runs it in a FreeBSD VM.
 #   sh build-pkg.sh <repo dir> <version>
 set -e
-cd "$(dirname "$0")"
 [ -n "$2" ] || { echo "usage: $0 <repo dir> <version>" >&2; exit 1; }
 mkdir -p "$1"
 REPO=$(realpath "$1")
+cd "$(dirname "$0")"
 VERSION=$2
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
