@@ -1,0 +1,39 @@
+<model>
+    <mount>//OPNsense/NetImpair</mount>
+    <version>1.0.0</version>
+    <description>Packet loss and latency per Traffic Shaper pipe</description>
+    <items>
+        <impairments>
+            <impairment type="ArrayField">
+                <enabled type="BooleanField">
+                    <Default>1</Default>
+                    <Required>Y</Required>
+                </enabled>
+                <pipe type="ModelRelationField">
+                    <Model>
+                        <pipes>
+                            <source>OPNsense.TrafficShaper.TrafficShaper</source>
+                            <items>pipes.pipe</items>
+                            <display>description</display>
+                        </pipes>
+                    </Model>
+                    <Required>Y</Required>
+                    <ValidationMessage>Pick a Traffic Shaper pipe.</ValidationMessage>
+                </pipe>
+                <delay type="IntegerField">
+                    <MinimumValue>0</MinimumValue>
+                    <MaximumValue>10000</MaximumValue>
+                    <ValidationMessage>Latency must be between 0 and 10000 ms.</ValidationMessage>
+                </delay>
+                <loss type="NumericField">
+                    <Default>0</Default>
+                    <Required>Y</Required>
+                    <MinimumValue>0</MinimumValue>
+                    <MaximumValue>100</MaximumValue>
+                    <ValidationMessage>Packet loss must be between 0 and 100 %.</ValidationMessage>
+                </loss>
+                <description type="DescriptionField"/>
+            </impairment>
+        </impairments>
+    </items>
+</model>
