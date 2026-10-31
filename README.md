@@ -49,7 +49,7 @@ The spoke dials the Lab Manager Hub over an outbound TLS WebSocket connection (`
 7. **NetBox Discovery Ingestion**: Continuously feeds DHCP leases and ARP neighbors into the NetBox spoke (`NETBOX_SYNC_DEVICES`) with `source="opnsense"`.
 8. **Interface Telemetry & System Health**: Real-time status reporting of interface link state, MTU, IP/MAC addresses, media flags, CPU utilization, and RAM metrics.
 9. **Trust Store Management**: Idempotent import and renewal of leaf SSL/TLS certificates and intermediate CA chains into the firewall trust store.
-10. **Network Impairment add-in** (`plugin/netimpair/`): an OPNsense plugin installed on the firewall itself that adds pfSense-style packet loss and latency to Traffic Shaper pipes (Firewall > Shaper > Impairment). See [`plugin/netimpair/README.md`](plugin/netimpair/README.md).
+10. **Network Impairment add-in** (`plugin/netimpair/`): an OPNsense plugin installed on the firewall itself that adds pfSense-style packet loss and latency to Traffic Shaper pipes (Firewall > Shaper > Impairment). Installable from System > Firmware > Plugins after adding its pkg repository once. See [`plugin/netimpair/README.md`](plugin/netimpair/README.md).
 
 ---
 
