@@ -1,0 +1,92 @@
+name: netimpair package
+
+# Builds the os-netimpair plugin as a FreeBSD package and test-installs it in a
+# FreeBSD VM. On main it is published as a pkg repository on the
+# "netimpair-repo" release, which OPNsense reads via plugin/netimpair/netimpair.conf
+# so the plugin can be installed from System > Firmware > Plugins.
+
+on:
+  push:
+    branches: [ dev, main ]
+    paths: [ 'plugin/netimpair/**', '.github/workflows/netimpair-pkg.yml' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  RELEASE: netimpair-repo
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      # PLUGIN_VERSION plus the number of commits that touched the plugin, so
+      # every change is an upgrade the firewall offers.
+      - name: Version
+        run: |
+          base=$(sed -n 's/^PLUGIN_VERSION=[[:space:]]*//p' plugin/netimpair/Makefile)
+          echo "VERSION=$base.$(git rev-list --count HEAD -- plugin/netimpair)" >> "$GITHUB_ENV"
+      - name: Build and test-install on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14"
+          envs: VERSION
+          usesh: true
+          sync: rsync
+          run: |
+            set -e
+            env ASSUME_ALWAYS_YES=yes pkg bootstrap -f
+            sh plugin/netimpair/build-pkg.sh repo "$VERSION"
+            mkdir -p /usr/local/etc/pkg/repos
+            printf 'local: { url: "file://%s/repo", signature_type: "none", enabled: yes }\n' "$PWD" \
+              > /usr/local/etc/pkg/repos/local.conf
+            pkg update -r local
+            pkg install -y -r local os-netimpair
+            test -x /usr/local/opnsense/scripts/OPNsense/NetImpair/dnctl.sh
+            pkg info os-netimpair
+            pkg delete -y os-netimpair
+            test ! -e /usr/local/opnsense/scripts/OPNsense/NetImpair/dnctl.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: os-netimpair-${{ env.VERSION }}
+          path: repo/
+      - name: Publish the pkg repository
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$RELEASE" >/dev/null 2>&1 || gh release create "$RELEASE" \
+            --title "os-netimpair pkg repository" --latest=false \
+            --notes "pkg repository for the OPNsense Network Impairment plugin. See plugin/netimpair/README.md."
+          # Drop older package files; the new repo catalogue only lists this one.
+          for a in $(gh release view "$RELEASE" --json assets -q '.assets[].name' | grep '^os-netimpair-.*\.pkg$'); do
+            [ "$a" = "os-netimpair-$VERSION.pkg" ] || gh release delete-asset "$RELEASE" "$a" -y
+          done
+          gh release upload "$RELEASE" repo/* plugin/netimpair/netimpair.conf --clobber
+
+  # Read the published repository the way a firewall does.
+  verify:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install from the release on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14"
+          usesh: true
+          sync: rsync
+          copyback: false
+          run: |
+            set -e
+            env ASSUME_ALWAYS_YES=yes pkg bootstrap -f
+            mkdir -p /usr/local/etc/pkg/repos
+            fetch -o /usr/local/etc/pkg/repos/netimpair.conf \
+              https://github.com/lbockenstedt/opnsense/releases/download/netimpair-repo/netimpair.conf
+            pkg update -r netimpair
+            pkg install -y -r netimpair os-netimpair
+            pkg info os-netimpair
