@@ -1,0 +1,2 @@
+rm -f /usr/local/etc/rc.conf.d/dnctl /usr/local/etc/netimpair.conf
+/usr/local/sbin/configctl shaper reload

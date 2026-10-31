@@ -1,0 +1,7 @@
+Network Impairment adds what pfSense limiters have and the OPNsense Traffic
+Shaper does not show: a packet loss rate (dummynet "plr") and a latency for a
+shaper pipe, to simulate a bad WAN link in a lab.
+
+Pick a pipe under Firewall > Shaper > Impairment, set the latency (ms) and the
+packet loss (%), and Apply. Traffic is sent into the pipe by the normal
+Traffic Shaper rules.
