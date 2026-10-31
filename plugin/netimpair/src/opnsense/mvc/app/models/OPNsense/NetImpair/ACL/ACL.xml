@@ -1,0 +1,9 @@
+<acl>
+    <page-firewall-shaper-impairment>
+        <name>Firewall: Shaper: Impairment</name>
+        <patterns>
+            <pattern>ui/netimpair/*</pattern>
+            <pattern>api/netimpair/*</pattern>
+        </patterns>
+    </page-firewall-shaper-impairment>
+</acl>
