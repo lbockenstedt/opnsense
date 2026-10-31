@@ -1,0 +1,7 @@
+<menu>
+    <Firewall>
+        <Shaper>
+            <Impairment order="35" url="/ui/netimpair/"/>
+        </Shaper>
+    </Firewall>
+</menu>

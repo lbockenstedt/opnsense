@@ -1,0 +1,30 @@
+<form>
+    <field>
+        <id>impairment.enabled</id>
+        <label>Enabled</label>
+        <type>checkbox</type>
+    </field>
+    <field>
+        <id>impairment.pipe</id>
+        <label>Pipe</label>
+        <type>dropdown</type>
+        <help>The Traffic Shaper pipe to impair. Traffic reaches it through the shaper's rules (Firewall > Shaper > Rules).</help>
+    </field>
+    <field>
+        <id>impairment.delay</id>
+        <label>Latency (ms)</label>
+        <type>text</type>
+        <help>Added one-way delay in milliseconds. Leave empty to keep the pipe's own delay. Put the pipe on both directions to add it to the round trip twice.</help>
+    </field>
+    <field>
+        <id>impairment.loss</id>
+        <label>Packet loss (%)</label>
+        <type>text</type>
+        <help>Share of packets dropped at random as they enter the pipe, e.g. 2.5 for 2.5 %.</help>
+    </field>
+    <field>
+        <id>impairment.description</id>
+        <label>Description</label>
+        <type>text</type>
+    </field>
+</form>
