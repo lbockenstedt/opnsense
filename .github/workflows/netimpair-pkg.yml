@@ -20,6 +20,10 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 14 = OPNsense 25.1-26.1, 15 = OPNsense 26.7.
+    strategy:
+      matrix:
+        freebsd: [ "14", "15" ]
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -32,7 +36,7 @@ jobs:
       - name: Build and test-install on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
-          release: "14"
+          release: ${{ matrix.freebsd }}
           envs: VERSION
           usesh: true
           sync: rsync
@@ -48,14 +52,16 @@ jobs:
             test -x /usr/local/opnsense/scripts/OPNsense/NetImpair/dnctl.sh
             grep -q '"product_id": "os-netimpair"' /usr/local/opnsense/version/netimpair
             pkg info os-netimpair
+            sh plugin/netimpair/tests/engine-test.sh
             pkg delete -y os-netimpair
             test ! -e /usr/local/opnsense/scripts/OPNsense/NetImpair/dnctl.sh
       - uses: actions/upload-artifact@v4
+        if: matrix.freebsd == '14'
         with:
           name: os-netimpair-${{ env.VERSION }}
           path: repo/
       - name: Publish the pkg repository
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && matrix.freebsd == '14'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
