@@ -4,6 +4,7 @@ import time
 from typing import Dict, Any
 from core.src.base_spoke import BaseSpoke
 from opnsense_engine import OpnsenseEngine
+import impairments
 
 logger = logging.getLogger("OpnSpoke")
 
@@ -428,6 +429,20 @@ class OpnSpoke(BaseSpoke):
                 data.get("ip", ""),
                 data.get("description", "")
             ), ["OPNSENSE_GET_DNS_RECORDS"])
+
+        # Network impairments (latency / loss per host or subnet, os-netimpair
+        # plugin). Few objects and always read live, so not cached.
+        elif normalized_cmd == "OPNSENSE_GET_IMPAIRMENTS":
+            return await impairments.list_impairments(self.engine)
+
+        elif normalized_cmd == "OPNSENSE_ADD_IMPAIRMENT":
+            return await impairments.add_impairment(self.engine, data)
+
+        elif normalized_cmd == "OPNSENSE_EDIT_IMPAIRMENT":
+            return await impairments.edit_impairment(self.engine, data.get("uuid", ""), data)
+
+        elif normalized_cmd == "OPNSENSE_DEL_IMPAIRMENT":
+            return await impairments.delete_impairment(self.engine, data.get("uuid", ""))
 
         elif normalized_cmd in ("INSTALL_CERT", "OPNSENSE_INSTALL_CERT"):
             # NOTE: the hub (cert_distribution.py) pushes a BARE ``INSTALL_CERT``
