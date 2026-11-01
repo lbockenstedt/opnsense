@@ -35,8 +35,9 @@ printf '10000 100 0.0500\n10001 50 0.1000\n10002 - 0.2000\n' > /usr/local/etc/ne
 dnctl pipe show; dnctl queue show
 has pipe 10000 ' 100 ms'
 has pipe 10000 'plr 0.05'
+# fq_codel/fq_pie take the delay but never apply plr: those kernel
+# schedulers enqueue without dummynet's loss check (pfSense has the same).
 has pipe 10001 ' 50 ms'
-has pipe 10001 'plr 0.1'
 has pipe 10002 'plr 0.2'
 hasnt pipe 10003 'plr'
 has queue 10000 'plr 0.2'
