@@ -19,6 +19,12 @@
                     </Model>
                     <Required>Y</Required>
                     <ValidationMessage>Pick a Traffic Shaper pipe.</ValidationMessage>
+                    <Constraints>
+                        <check001>
+                            <ValidationMessage>This pipe already has an impairment.</ValidationMessage>
+                            <type>UniqueConstraint</type>
+                        </check001>
+                    </Constraints>
                 </pipe>
                 <delay type="IntegerField">
                     <MinimumValue>0</MinimumValue>

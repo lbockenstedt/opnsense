@@ -62,6 +62,24 @@ The OPNsense Spoke acts as a bridge between the Lab Manager Hub and the OPNsense
   - **Payload**: `{}`
   - **Response**: `{"status": "SUCCESS", "data": [...]}`
 
+### Network Impairment (latency / packet loss)
+Needs the `os-netimpair` plugin on the firewall (see `plugin/netimpair`) and an
+API key with the *Firewall: Shaper* and *Firewall: Shaper: Impairment*
+privileges. Each impairment is a Traffic Shaper pipe + rule per direction plus a
+netimpair entry, all tagged `lm-impair:<id>:<down|up>` in their description
+(`src/impairments.py`). Without the plugin every command returns an ERROR
+saying so.
+- **`OPNSENSE_GET_IMPAIRMENTS`**
+  - **Payload**: `{}`
+  - **Response**: `{"status": "SUCCESS", "data": [{"uuid", "target", "interface", "direction", "delay", "loss", "description", "enabled", "complete"}]}`
+- **`OPNSENSE_ADD_IMPAIRMENT`**
+  - **Payload**: `{"target": "10.0.0.5" | "10.0.0.0/24", "interface": "lan", "direction": "both|download|upload", "delay": ms (0-10000), "loss": % (0-100), "description": "", "enabled": "1"}`
+  - **Response**: `{"status": "SUCCESS", "uuid": "<id>"}`. A failed step deletes what was already created.
+- **`OPNSENSE_EDIT_IMPAIRMENT`**
+  - **Payload**: the add payload plus `"uuid"`. The new version is built before the old one is removed, so a failed edit keeps the original; the response carries the new `uuid`.
+- **`OPNSENSE_DEL_IMPAIRMENT`**
+  - **Payload**: `{"uuid": "<id>"}`
+
 ## Integration Flow
 1. **Command Trigger**: The Hub sends a signed WebSocket message with `command_type` (e.g., `OPNSENSE_ADD_RULE`).
 2. **Execution**: The `OpnSpoke` handles the command and calls the `OpnsenseEngine`.

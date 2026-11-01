@@ -20,7 +20,7 @@
         <id>impairment.loss</id>
         <label>Packet loss (%)</label>
         <type>text</type>
-        <help>Share of packets dropped at random as they enter the pipe, e.g. 2.5 for 2.5 %.</help>
+        <help>Share of packets dropped at random as they enter the pipe, e.g. 2.5 for 2.5 %. Not applied when the pipe's scheduler is FQ-CoDel or FQ-PIE (a FreeBSD limitation, same as pfSense): use the default scheduler for a lossy pipe.</help>
     </field>
     <field>
         <id>impairment.description</id>
