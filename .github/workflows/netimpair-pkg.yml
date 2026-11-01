@@ -46,6 +46,7 @@ jobs:
             pkg update -r local
             pkg install -y -r local os-netimpair
             test -x /usr/local/opnsense/scripts/OPNsense/NetImpair/dnctl.sh
+            grep -q '"product_id": "os-netimpair"' /usr/local/opnsense/version/netimpair
             pkg info os-netimpair
             pkg delete -y os-netimpair
             test ! -e /usr/local/opnsense/scripts/OPNsense/NetImpair/dnctl.sh
