@@ -25,6 +25,10 @@ Then go to **System > Firmware > Plugins**, click **Check for updates**, find
 same page like any other plugin. The page shows up under
 **Firewall > Shaper > Impairment** (reload the browser once).
 
+If the plugin shows as **os-netimpair (misconfigured)** (installed with
+1.0.3 or older, which did not register itself), update or reinstall it from
+the same page.
+
 The repository is built by `.github/workflows/netimpair-pkg.yml` on every
 change to `main` and published on the `netimpair-repo` release. It is not
 signed, so `netimpair.conf` sets `signature_type: "none"`.
