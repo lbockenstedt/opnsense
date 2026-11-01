@@ -8,6 +8,10 @@ bad WAN link in the lab.
 It adds **Firewall > Shaper > Impairment**: pick a shaper pipe, set a latency (ms)
 and a packet loss (%), Apply.
 
+Requires **OPNsense 25.1 or newer** (older releases load the shaper pipes from
+`ipfw.rules`, which this plugin does not patch). Tested against FreeBSD 14
+and 15 dummynet in CI (`tests/engine-test.sh`).
+
 ## Install
 
 ### From the OPNsense GUI (recommended)
@@ -71,8 +75,12 @@ The plugin:
   `scripts/OPNsense/NetImpair/dnctl.sh`;
 - writes `/usr/local/etc/netimpair.conf`: one line per enabled impairment,
   `<pipe number> <delay ms or -> <loss fraction>`;
-- `dnctl.sh` copies `dnctl.conf`, adds ` delay N` / ` plr X` to the matching
-  `pipe N config` lines (`impair.awk`), and loads the copy with `/sbin/dnctl`.
+- `dnctl.sh` copies `dnctl.conf`, adds ` delay N` / ` plr X` right after
+  `config` on the matching `pipe N config` lines, and ` plr X` on every
+  `queue M config pipe N` line of that pipe (`impair.awk`), then loads the copy
+  with `/sbin/dnctl`. The options go right after `config` because dnctl
+  treats everything after `type fq_codel` / `codel` / `pie` as scheduler
+  parameters and would silently ignore them at the end of the line.
 
 No OPNsense files are changed, so firmware updates keep working. With nothing
 configured, `dnctl.sh` simply runs `/sbin/dnctl` on the original file.
@@ -82,4 +90,50 @@ configured, `dnctl.sh` simply runs `/sbin/dnctl` on the original file.
 - dummynet has no jitter, so latency is a fixed delay.
 - Loss is random per packet (no burst loss).
 - An impairment only acts on a pipe that is enabled and that a shaper rule sends
-  traffic to.
+  traffic to (directly or through one of the pipe's queues).
+- **Packet loss does nothing on a pipe whose scheduler is FlowQueue-CoDel or
+  FlowQueue-PIE**: those FreeBSD schedulers never check the loss rate (pfSense
+  has the same limit). Latency still works. Use the default scheduler for a
+  lossy pipe.
+- One impairment per pipe.
+
+## Configure through the OPNsense API
+
+Everything in the GUI is also an MVC API. Use an OPNsense API key/secret
+(basic auth) whose user has the **Firewall: Shaper: Impairment** privilege
+(plus **Firewall: Shaper** to manage pipes and rules).
+
+| Call | Method |
+| --- | --- |
+| `/api/netimpair/settings/search_impairment` | GET/POST |
+| `/api/netimpair/settings/get_impairment/<uuid>` | GET |
+| `/api/netimpair/settings/add_impairment` | POST |
+| `/api/netimpair/settings/set_impairment/<uuid>` | POST |
+| `/api/netimpair/settings/del_impairment/<uuid>` | POST |
+| `/api/netimpair/settings/toggle_impairment/<uuid>` | POST |
+| `/api/netimpair/service/reconfigure` | POST → `{"status":"ok"}` |
+
+```sh
+curl -k -u "$KEY:$SECRET" -H 'Content-Type: application/json' \
+  -d '{"impairment":{"enabled":"1","pipe":"<pipe uuid>","delay":"100","loss":"5","description":"wan"}}' \
+  https://fw/api/netimpair/settings/add_impairment
+curl -k -u "$KEY:$SECRET" -X POST https://fw/api/netimpair/service/reconfigure
+```
+
+Pipe UUIDs come from `/api/trafficshaper/settings/search_pipes`; pipes and
+rules are created with the Traffic Shaper API (`add_pipe`, `add_rule`,
+`/api/trafficshaper/service/reconfigure`).
+
+**Lab Manager** drives all of this for you: Firewalls → Impairment takes a host
+or subnet, interface, latency, loss and direction, and creates the pipes,
+rules and impairments (tagged `lm-impair:` in their descriptions).
+
+## Compared with pfSense limiters
+
+| | pfSense limiter | os-netimpair |
+| --- | --- | --- |
+| Delay | 0–10000 ms on the limiter | 0–10000 ms per pipe |
+| Packet loss | on the limiter; the queue PLR field is never applied | per pipe, also applied to the pipe's queues |
+| FQ-CoDel / FQ-PIE | loss ignored by the kernel | same |
+| Jitter / burst loss | no | no |
+| Matching traffic | firewall rule In/Out pipe | Traffic Shaper rule |
