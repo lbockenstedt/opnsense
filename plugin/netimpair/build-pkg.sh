@@ -15,17 +15,39 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/root/usr/local" "$WORK/meta"
 cp -R src/opnsense "$WORK/root/usr/local/"
 chmod 0755 "$WORK/root/usr/local/opnsense/scripts/OPNsense/NetImpair/dnctl.sh"
-(cd "$WORK/root" && find usr -type f | sort | sed 's|^|/|') > "$WORK/plist"
 
 comment=$(sed -n 's/^PLUGIN_COMMENT=[[:space:]]*//p' Makefile)
 maintainer=$(sed -n 's/^PLUGIN_MAINTAINER=[[:space:]]*//p' Makefile)
+WWW="https://github.com/lbockenstedt/opnsense/tree/main/plugin/netimpair"
+
+# Plugin metadata. OPNsense only registers a plugin (otherwise it is listed
+# as "misconfigured") when this file exists; same fields as the official
+# plugins' Templates/version.
+mkdir -p "$WORK/root/usr/local/opnsense/version"
+cat > "$WORK/root/usr/local/opnsense/version/netimpair" <<VERSIONINFO
+{
+    "product_abi": "",
+    "product_arch": "",
+    "product_conflicts": "",
+    "product_email": "$maintainer",
+    "product_hash": "",
+    "product_id": "os-netimpair",
+    "product_name": "netimpair",
+    "product_tier": "3",
+    "product_version": "$VERSION",
+    "product_website": "$WWW"
+}
+VERSIONINFO
+
+(cd "$WORK/root" && find usr -type f | sort | sed 's|^|/|') > "$WORK/plist"
+
 cat > "$WORK/meta/+MANIFEST" <<MANIFEST
 name: os-netimpair
 version: "$VERSION"
 origin: opnsense/os-netimpair
 comment: "$comment"
 maintainer: "$maintainer"
-www: "https://github.com/lbockenstedt/opnsense/tree/main/plugin/netimpair"
+www: "$WWW"
 prefix: /usr/local
 abi: "FreeBSD:*:*"
 categories: [net]
@@ -43,12 +65,19 @@ rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cac
 if [ -x /usr/local/sbin/configctl ]; then
     /usr/local/sbin/configctl template reload OPNsense/NetImpair
 fi
+# Record the plugin in config.xml (System > Firmware > Plugins).
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php install os-netimpair
+fi
 SCRIPT
 cat > "$WORK/meta/+POST_DEINSTALL" <<'SCRIPT'
 rm -f /usr/local/etc/rc.conf.d/dnctl /usr/local/etc/netimpair.conf
 rm -f /var/lib/php/tmp/opnsense_menu_cache.xml /var/lib/php/tmp/opnsense_acl_cache.json
 if [ -x /usr/local/sbin/configctl ]; then
     /usr/local/sbin/configctl shaper reload
+fi
+if [ -x /usr/local/opnsense/scripts/firmware/register.php ]; then
+    /usr/local/opnsense/scripts/firmware/register.php remove os-netimpair
 fi
 SCRIPT
 
