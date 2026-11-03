@@ -170,6 +170,34 @@ class OpnSpoke(BaseSpoke):
                 self._cache_ts.pop(k, None)
         return res
 
+    async def _install_cert_on_devices(self, data: Dict[str, Any], devices: list) -> Dict[str, Any]:
+        import asyncio
+
+        async def one(d):
+            name = d.get("name") or d.get("host")
+            host = f"{d['host']}:{d.get('port') or 8443}"
+            if not (d.get("api_key") and d.get("api_secret")):
+                return {"device_id": name, "name": name, "ip": host, "cert_capable": True,
+                        "status": "ERROR", "message": "missing API key/secret"}
+            eng = OpnsenseEngine(host=host, api_key=d["api_key"], api_secret=d["api_secret"])
+            try:
+                r = await eng.import_cert(data.get("domain", ""), data.get("fullchain", ""),
+                                          data.get("privkey", ""))
+            except Exception as e:  # noqa: BLE001 — one box must not sink the others
+                r = {"status": "ERROR", "message": str(e)}
+            return {"device_id": name, "name": name, "ip": host, "cert_capable": True,
+                    "status": r.get("status"), "message": r.get("message")}
+
+        results = await asyncio.gather(*(one(d) for d in devices))
+        ok = [r for r in results if r["status"] == "SUCCESS"]
+        for r in results:
+            logger.info("[cert] %s on %s (%s): %s — %s", data.get("domain"), r["name"],
+                        r["ip"], r["status"], r["message"])
+        summary = "; ".join(f"{r['name']}: {r['message']}" for r in results)
+        return {"status": "SUCCESS" if len(ok) == len(results) else "ERROR",
+                "message": f"{len(ok)}/{len(results)} firewall(s) — {summary}",
+                "devices": results}
+
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch a hub command to the matching OPNsense engine action.
 
@@ -190,10 +218,13 @@ class OpnSpoke(BaseSpoke):
         # an api_key/api_secret exposed in telemetry/SPOKE_LOG relayed to the
         # hub), which is a meaningful fraction of a typical OPNsense API secret.
         _SENSITIVE = {"api_key", "api_secret", "password", "privkey", "private_key"}
-        log_data = {
-            k: ("********" if k in _SENSITIVE else v)
-            for k, v in data.items()
-        } if isinstance(data, dict) else data
+        def _mask(v):
+            if isinstance(v, dict):
+                return {k: ("********" if k in _SENSITIVE else _mask(x)) for k, x in v.items()}
+            if isinstance(v, list):
+                return [_mask(x) for x in v]
+            return v
+        log_data = _mask(data)
 
         logger.debug(f"Handling Opn Command: {command_type} with data {log_data}")
 
@@ -455,11 +486,17 @@ class OpnSpoke(BaseSpoke):
             # applies it to the firewall it's in the vicinity of. ``privkey`` is a
             # secret — masked in the log line above (see _SENSITIVE) and never
             # persisted beyond the import call.
-            return await self.engine.import_cert(
-                data.get("domain", ""),
-                data.get("fullchain", ""),
-                data.get("privkey", ""),
-            )
+            # ``devices`` (hub-supplied, vault-resolved) = EVERY firewall bound
+            # to this spoke (e.g. an HA pair). Each gets the cert + WebGUI
+            # activation directly instead of relying on HA config sync.
+            devices = [d for d in (data.get("devices") or []) if isinstance(d, dict) and d.get("host")]
+            if not devices:
+                return await self.engine.import_cert(
+                    data.get("domain", ""),
+                    data.get("fullchain", ""),
+                    data.get("privkey", ""),
+                )
+            return await self._install_cert_on_devices(data, devices)
 
         elif normalized_cmd == "SEARCH_DHCP":
             # Tenant-scoped DHCP search across dynamic leases AND static
