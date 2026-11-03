@@ -514,3 +514,35 @@ def test_unassigned_webgui_cert_is_healed_by_restart_then_replaced(monkeypatch):
     assert "activated on the WebGUI" in res["message"], res
     assert any(c["endpoint"] == "/api/core/service/restart/webgui" for c in calls)
     assert _cert_call(calls, "/api/trust/cert/set/new") is not None
+
+
+def _fake_curl(monkeypatch, body: bytes):
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return body, b""
+
+    async def _exec(*_a, **_k):
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _exec)
+
+
+def test_request_reports_http_error_status(monkeypatch):
+    # A 403 JSON body (API user lacking a privilege) must be an ERROR, not a
+    # parsed "success" that let a rejected cert add be reported as "added".
+    _fake_curl(monkeypatch, b'{"status":403,"message":"Forbidden"}\n__LM_HTTP_STATUS__:403')
+    eng = OpnsenseEngine(host="fw:8443", api_key="k", api_secret="s")
+    res = _run(eng._request("POST", "/api/trust/cert/add", data={}))
+    assert res["status"] == "ERROR" and res["http_status"] == 403
+    assert "Forbidden" in res["message"] and "privilege" in res["message"]
+    assert eng._write_failure(res)
+
+
+def test_request_ok_strips_status_marker(monkeypatch):
+    _fake_curl(monkeypatch, b'{"result":"saved"}\n__LM_HTTP_STATUS__:200')
+    eng = OpnsenseEngine(host="fw:8443", api_key="k", api_secret="s")
+    assert _run(eng._request("POST", "/api/x", data={})) == {"result": "saved"}
+    _fake_curl(monkeypatch, b'<opnsense/>\n__LM_HTTP_STATUS__:200')
+    assert _run(eng._request("GET", "/api/x", raw=True)) == {"raw": "<opnsense/>"}
