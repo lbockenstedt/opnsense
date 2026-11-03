@@ -74,8 +74,10 @@ class OpnsenseEngine:
         url = f"https://{self.host}{endpoint}"
         logger.debug(f"Attempting API request to: {url}")
 
-        # TLS verification is on by default. Lab firewalls with self-signed
-        # certificates can opt out with LM_OPNSENSE_VERIFY_TLS=0/false.
+        # TLS verification is OFF by default (fleet convention: encrypted,
+        # verify opt-in) — firewalls are addressed by IP and ship a self-signed
+        # WebGUI cert, so verifying would fail every call (including the LE cert
+        # install that would replace it). Opt in with LM_OPNSENSE_VERIFY_TLS=1.
         # -sS: silent progress but STILL surface errors on stderr, so a timeout
         # (curl 28) or TLS error yields a real message instead of an empty one.
         # --connect-timeout bounds the TCP/TLS handshake separately from the
@@ -84,11 +86,8 @@ class OpnsenseEngine:
         connect_timeout = min(10, timeout)
         cmd = ["curl", "-sS", "--connect-timeout", str(connect_timeout),
                "--max-time", str(timeout)]
-        verify_tls = os.getenv("LM_OPNSENSE_VERIFY_TLS", "1").strip().lower()
-        if verify_tls in {"0", "false", "no", "off"}:
-            logger.warning("LM_OPNSENSE_VERIFY_TLS=%s disables TLS certificate "
-                           "verification for OPNsense API requests; use only "
-                           "with trusted lab/self-signed endpoints.", verify_tls)
+        verify_tls = os.getenv("LM_OPNSENSE_VERIFY_TLS", "0").strip().lower()
+        if verify_tls not in {"1", "true", "yes", "on"}:
             cmd.append("-k")
         auth_cfg_path = None
         try:
