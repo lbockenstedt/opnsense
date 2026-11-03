@@ -10,6 +10,9 @@ from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger("OpnsenseEngine")
 
+_HTTP_STATUS_MARK = "__LM_HTTP_STATUS__:"
+
+
 class OpnsenseEngine:
     """
     Core interaction layer for the OPNsense API.
@@ -49,6 +52,17 @@ class OpnsenseEngine:
             logger.warning("No firewall configured — supply opn_host + API "
                            "credentials via the OPNsense connection settings; "
                            "skipping API calls until then.")
+
+    @staticmethod
+    def _http_error_detail(text: str) -> str:
+        import json
+        try:
+            body = json.loads(text)
+            if isinstance(body, dict):
+                return str(body.get("message") or body.get("errorMessage") or body)[:300]
+        except Exception:  # noqa: BLE001
+            pass
+        return re.sub(r"<[^>]+>|\s+", " ", text).strip()[:300] or "no response body"
 
     async def _request(self, method: str, endpoint: str, data: Dict = None,
                        timeout: int = 15, raw: bool = False) -> Dict[str, Any]:
@@ -109,7 +123,9 @@ class OpnsenseEngine:
             # "Invalid JSON syntax" if it sees Content-Type: application/json with no body.
             if data is not None:
                 cmd.extend(["-H", "Content-Type: application/json", "-d", json.dumps(data)])
-            cmd.append(url)
+            # Append the HTTP status so 4xx/5xx bodies (e.g. 403 for an API user
+            # lacking a privilege) are reported as errors, not parsed as success.
+            cmd.extend(["-w", "\n" + _HTTP_STATUS_MARK + "%{http_code}", url])
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -129,7 +145,19 @@ class OpnsenseEngine:
                 logger.error(f"Curl request failed for {url}: {error_msg}")
                 return {"status": "ERROR", "message": error_msg}
 
-            result_text = stdout.decode().strip()
+            out_text = stdout.decode()
+            result_text, marked, code = out_text.rpartition(_HTTP_STATUS_MARK)
+            if not marked:
+                result_text, code = out_text, ""
+            result_text = result_text.strip()
+            http_status = int(code) if code.strip().isdigit() else 0
+            if http_status >= 400:
+                error_msg = f"HTTP {http_status}: {self._http_error_detail(result_text)}"
+                if http_status in (401, 403):
+                    error_msg += (" (check the API key/secret and that its user has the "
+                                  "privilege for this page)")
+                logger.error(f"API request failed for {method} {endpoint}: {error_msg}")
+                return {"status": "ERROR", "message": error_msg, "http_status": http_status}
             if not result_text:
                 return {"status": "ERROR", "message": "Empty response from server"}
             if raw:
