@@ -761,13 +761,36 @@ class OpnsenseEngine:
                                       data={"cert": cert_payload},
                                       timeout=self._CERT_IMPORT_TIMEOUT)
             action = "added"
-        if isinstance(res, dict) and res.get("status") == "ERROR":
+        failure = self._write_failure(res)
+        if failure:
             # Surface the CA import results alongside so a "missing CA key" leaf
             # failure is diagnosable (did the CA import succeed?).
-            return {"status": "ERROR", "message": res.get("message", "cert import failed"),
+            logger.warning("[cert] import of '%s' into OPNsense Trust FAILED (%s): %s; CA imports: %s",
+                           domain, action, failure, ca_imports)
+            return {"status": "ERROR", "message": f"cert import failed: {failure}",
                     "ca_imports": ca_imports}
+        logger.info("[cert] '%s' %s in OPNsense Trust (uuid=%s); CA imports: %s",
+                    domain, action, existing_uuid or (res or {}).get("uuid"), ca_imports)
         return {"status": "SUCCESS", "message": f"cert '{domain}' {action}",
                 "ca_imports": ca_imports}
+
+    @staticmethod
+    def _write_failure(res: Any) -> Optional[str]:
+        """Return a failure message for an OPNsense model write (add/set), or
+        ``None`` on success. OPNsense reports validation errors as HTTP 200 with
+        ``{"result": "failed", "validations": {field: msg}}`` — never as an
+        HTTP error — so checking only our own ``status == "ERROR"`` let a
+        rejected import be reported as SUCCESS (and the hub never retried)."""
+        if not isinstance(res, dict):
+            return "unexpected response from OPNsense"
+        if res.get("status") == "ERROR":
+            return str(res.get("message") or "request failed")
+        validations = res.get("validations")
+        if str(res.get("result", "")).lower() == "failed" or validations:
+            if isinstance(validations, dict) and validations:
+                return "; ".join(f"{k}: {v}" for k, v in validations.items())
+            return str(res.get("message") or "OPNsense rejected the request (result=failed)")
+        return None
 
     async def import_ca(self, descr: str, ca_pem: str) -> Dict[str, Any]:
         """Import a CA certificate into Trust→Authorities (idempotent via search
@@ -789,8 +812,10 @@ class OpnsenseEngine:
                                       data={"ca": payload},
                                       timeout=self._CERT_IMPORT_TIMEOUT)
             action = "added"
-        if isinstance(res, dict) and res.get("status") == "ERROR":
-            return res
+        failure = self._write_failure(res)
+        if failure:
+            logger.info("[cert] CA '%s' import (%s) not applied: %s", descr, action, failure)
+            return {"status": "ERROR", "message": failure}
         return {"status": "SUCCESS", "message": f"ca '{descr}' {action}"}
 
     async def _find_ca_uuid(self, descr: str) -> Optional[str]:
@@ -801,7 +826,7 @@ class OpnsenseEngine:
             return None
         try:
             res = await self._request("POST", "/api/trust/ca/search",
-                                      data={"search": descr})
+                                      data={"searchPhrase": descr, "search": descr})
         except Exception:
             return None
         if not isinstance(res, dict):
@@ -842,7 +867,7 @@ class OpnsenseEngine:
             return None
         try:
             res = await self._request("POST", "/api/trust/cert/search",
-                                      data={"search": descr})
+                                      data={"searchPhrase": descr, "search": descr})
         except Exception:
             return None
         if not isinstance(res, dict):
