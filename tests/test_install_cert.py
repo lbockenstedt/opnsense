@@ -484,3 +484,33 @@ def test_webgui_identified_by_config_certref_even_if_live_cert_is_stale(monkeypa
     res = _run(eng.import_cert("example.com", _FULLCHAIN, _KEY))
     assert "activated on the WebGUI" in res["message"]
     assert _cert_call(calls, "/api/trust/cert/set/gui") is not None
+
+
+def test_unassigned_webgui_cert_is_healed_by_restart_then_replaced(monkeypatch):
+    """Config has no ssl-certref and the live cert isn't in Trust → restart the
+    WebGUI (OPNsense creates + assigns a self-signed cert), re-identify, replace."""
+    stale, regenerated = _real_pem(), _real_pem()
+    eng, calls, state = _webgui_engine(stale, [], {"/api/trust/cert/set/new": {"result": "saved"}})
+    real = eng._request
+    cfg = {"xml": "<opnsense><system><webgui><protocol>https</protocol></webgui></system></opnsense>"}
+    import base64
+
+    async def req(method, endpoint, data=None, timeout=15, raw=False):
+        if endpoint == "/api/core/backup/download/this":
+            return {"raw": cfg["xml"]}
+        if endpoint == "/api/core/service/restart/webgui":
+            state["served"] = OpnsenseEngine._pem_to_der(regenerated)
+            cfg["xml"] = "<opnsense><system><webgui><ssl-certref>R9</ssl-certref></webgui></system></opnsense>"
+            calls.append({"endpoint": endpoint})
+            return {"status": "ERROR", "message": "curl: (16)"}
+        if endpoint == "/api/trust/cert/search" and cfg["xml"].find("R9") > 0:
+            return {"rows": [{"uuid": "new", "refid": "R9", "descr": "Web GUI TLS certificate",
+                              "crt": base64.b64encode(regenerated.encode()).decode()}]}
+        return await real(method, endpoint, data, timeout)
+    eng._request = req
+    monkeypatch.setattr("asyncio.sleep", lambda *_: _done(None))
+    monkeypatch.setattr(eng, "_restart_webgui_and_verify", lambda leaf, **k: _done(True))
+    res = _run(eng.import_cert("example.com", _FULLCHAIN, _KEY))
+    assert "activated on the WebGUI" in res["message"], res
+    assert any(c["endpoint"] == "/api/core/service/restart/webgui" for c in calls)
+    assert _cert_call(calls, "/api/trust/cert/set/new") is not None
