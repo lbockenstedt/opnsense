@@ -43,7 +43,7 @@ def _make_engine(responses):
     eng = OpnsenseEngine(host="fw:8443", api_key="k", api_secret="s")
     calls = []
 
-    async def fake_request(method, endpoint, data=None, timeout=15):
+    async def fake_request(method, endpoint, data=None, timeout=15, raw=False):
         base = endpoint.split("?", 1)[0]
         calls.append({"method": method, "endpoint": base, "data": data, "timeout": timeout})
         return responses.get(base, {"status": "ERROR", "message": "not found"})
@@ -106,7 +106,7 @@ def test_import_cert_imports_intermediate_as_ca_first():
     ca_add = next((c for c in calls if c["endpoint"] == "/api/trust/ca/add"), None)
     assert ca_add is not None
     ca = ca_add["data"]["ca"]
-    assert ca["action"] == "import"
+    assert ca["action"] == "existing"  # Ca.xml OptionValues: existing|internal|ocsp
     assert ca["descr"] == "lm-le-example.com-ca"  # single intermediate → no index
     assert ca["crt_payload"] == _INTER
     # CA add happens before the cert add.
@@ -463,3 +463,24 @@ def test_install_cert_on_every_bound_firewall(monkeypatch, caplog):
     assert res["status"] == "ERROR" and res["message"].startswith("1/2 firewall(s)")
     assert {d["name"]: d["status"] for d in res["devices"]} == {"FW1": "SUCCESS", "FW2": "ERROR"}
     assert "TOPSECRET" not in caplog.text
+
+
+def test_webgui_identified_by_config_certref_even_if_live_cert_is_stale(monkeypatch):
+    """HA backup: the live cert is stale, but config ssl-certref names a Trust
+    row → that row is the WebGUI cert (replaced in place)."""
+    selfsigned, stale = _real_pem(), _real_pem()
+    eng, calls, _ = _webgui_engine(stale, [
+        {"uuid": "gui", "refid": "R1", "descr": "Web GUI TLS certificate", "_pem": selfsigned}],
+        {"/api/trust/cert/set/gui": {"result": "saved"}})
+    real = eng._request
+
+    async def req(method, endpoint, data=None, timeout=15, raw=False):
+        if endpoint == "/api/core/backup/download/this":
+            return {"raw": "<opnsense><system><webgui><protocol>https</protocol>"
+                           "<ssl-certref>R1</ssl-certref></webgui></system></opnsense>"}
+        return await real(method, endpoint, data, timeout)
+    eng._request = req
+    monkeypatch.setattr(eng, "_restart_webgui_and_verify", lambda leaf, **k: _done(True))
+    res = _run(eng.import_cert("example.com", _FULLCHAIN, _KEY))
+    assert "activated on the WebGUI" in res["message"]
+    assert _cert_call(calls, "/api/trust/cert/set/gui") is not None
