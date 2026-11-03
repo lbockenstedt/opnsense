@@ -4,6 +4,8 @@ import re
 import tempfile
 import time
 import asyncio
+import base64
+import ssl
 from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger("OpnsenseEngine")
@@ -748,8 +750,23 @@ class OpnsenseEngine:
             "cert_type": "usr_cert", "private_key_location": "firewall",
             "crt_payload": leaf, "prv_payload": privkey, "csr_payload": "",
         }
-        # Find an existing cert with this descr → update in place (idempotent renew).
-        existing_uuid = await self._find_cert_uuid(domain or "")
+        # Activation: OPNsense has no API to point the WebGUI at a different
+        # cert (ssl-certref is legacy config), but updating the cert object the
+        # WebGUI ALREADY serves keeps its refid — so the WebGUI picks up the new
+        # material on restart. Locate that object by fingerprinting the live
+        # HTTPS cert; replace it when it is the factory self-signed cert or an
+        # earlier cert for this domain (never someone else's CA-signed cert).
+        activate = os.getenv("LM_OPNSENSE_ACTIVATE_WEBGUI", "1").strip().lower() not in {"0", "false", "no", "off"}
+        webgui = await self._webgui_cert_row() if activate else None
+        webgui_uuid = None
+        if webgui:
+            row, self_signed = webgui
+            if self_signed or row.get("descr") == domain or row.get("commonname") == domain:
+                webgui_uuid = row.get("uuid")
+            else:
+                logger.info("[cert] WebGUI serves '%s' (%s) — not an LM/self-signed cert, leaving it",
+                            row.get("descr"), row.get("commonname"))
+        existing_uuid = webgui_uuid or await self._find_cert_uuid(domain or "")
         if existing_uuid:
             res = await self._request("POST", f"/api/trust/cert/set/{existing_uuid}",
                                       data={"cert": cert_payload},
@@ -770,8 +787,117 @@ class OpnsenseEngine:
                     "ca_imports": ca_imports}
         logger.info("[cert] '%s' %s in OPNsense Trust (uuid=%s); CA imports: %s",
                     domain, action, existing_uuid or (res or {}).get("uuid"), ca_imports)
-        return {"status": "SUCCESS", "message": f"cert '{domain}' {action}",
-                "ca_imports": ca_imports}
+        message = f"cert '{domain}' {action}"
+        if webgui_uuid:
+            await self._remove_stale_duplicates(domain, keep_uuid=webgui_uuid)
+            active = await self._restart_webgui_and_verify(leaf)
+            message += ("; activated on the WebGUI" if active
+                        else "; WebGUI restarted but still serving the previous cert")
+        elif activate and not webgui:
+            message += "; WebGUI cert could not be identified — not activated"
+        elif activate:
+            message += "; WebGUI uses another cert — not activated"
+        return {"status": "SUCCESS", "message": message, "ca_imports": ca_imports}
+
+    @staticmethod
+    def _pem_to_der(pem: str) -> Optional[bytes]:
+        m = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem or "", re.DOTALL)
+        if not m:
+            return None
+        try:
+            return ssl.PEM_cert_to_DER_cert(m.group(0))
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _served_cert_der(self) -> Optional[bytes]:
+        """DER of the cert the WebGUI presents right now (no verification)."""
+        if not self.host:
+            return None
+        host, _, port = self.host.partition(":")
+        try:
+            pem = await asyncio.wait_for(asyncio.to_thread(
+                ssl.get_server_certificate, (host, int(port or 443))), timeout=15)
+        except Exception as e:  # noqa: BLE001
+            logger.info("[cert] could not read the WebGUI cert from %s: %s", self.host, e)
+            return None
+        return self._pem_to_der(pem)
+
+    async def _trust_cert_rows(self) -> List[Dict[str, Any]]:
+        res = await self._request("POST", "/api/trust/cert/search",
+                                  data={"current": 1, "rowCount": -1, "searchPhrase": ""})
+        if not isinstance(res, dict):
+            return []
+        return [r for r in (res.get("rows") or []) if isinstance(r, dict)]
+
+    @staticmethod
+    def _row_der(row: Dict[str, Any]) -> Optional[bytes]:
+        crt = row.get("crt") or ""
+        try:
+            pem = base64.b64decode(crt).decode("utf-8", "replace") if crt else ""
+        except Exception:  # noqa: BLE001
+            return None
+        return OpnsenseEngine._pem_to_der(pem)
+
+    async def _webgui_cert_row(self) -> Optional[Tuple[Dict[str, Any], bool]]:
+        """Return ``(trust row, self_signed)`` for the cert the WebGUI serves,
+        or ``None`` if it can't be matched to a Trust object."""
+        served = await self._served_cert_der()
+        if not served:
+            return None
+        for row in await self._trust_cert_rows():
+            if self._row_der(row) == served:
+                return row, self._der_self_signed(served)
+        logger.info("[cert] WebGUI cert on %s matches no Trust certificate", self.host)
+        return None
+
+    @staticmethod
+    def _der_self_signed(der: bytes) -> bool:
+        """True when subject == issuer (cryptography if installed, else the
+        openssl CLI; False when neither can parse it)."""
+        try:
+            from cryptography import x509  # type: ignore
+            c = x509.load_der_x509_certificate(der)
+            return c.subject == c.issuer
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import subprocess
+            out = subprocess.run(["openssl", "x509", "-inform", "DER", "-noout",
+                                  "-subject", "-issuer", "-nameopt", "RFC2253"],
+                                 input=der, capture_output=True, timeout=10).stdout.decode()
+            vals = [ln.split("=", 1)[1].strip() for ln in out.splitlines() if "=" in ln]
+            return len(vals) == 2 and vals[0] == vals[1]
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _remove_stale_duplicates(self, descr: str, keep_uuid: str) -> None:
+        """Delete other Trust certs with the same descr that nothing uses
+        (left by imports before WebGUI activation existed). OPNsense refuses
+        to delete an in-use cert, so this is safe best-effort."""
+        for row in await self._trust_cert_rows():
+            if (row.get("descr") == descr and row.get("uuid") and row.get("uuid") != keep_uuid
+                    and str(row.get("in_use", "0")) in ("0", "", "False", "false")):
+                res = await self._request("POST", f"/api/trust/cert/del/{row['uuid']}", data={})
+                logger.info("[cert] removed unused duplicate '%s' (%s): %s",
+                            descr, row["uuid"], self._write_failure(res) or "ok")
+
+    async def _restart_webgui_and_verify(self, leaf_pem: str, attempts: int = 10,
+                                         delay: float = 3.0) -> bool:
+        """Restart the WebGUI so it loads the updated cert, then confirm the
+        live HTTPS cert is the new leaf. The restart drops the API connection
+        mid-response, so a transport error from that call is expected."""
+        want = self._pem_to_der(leaf_pem)
+        if want and await self._served_cert_der() == want:
+            return True
+        res = await self._request("POST", "/api/core/service/restart/webgui", data={})
+        logger.info("[cert] WebGUI restart requested: %s", res)
+        for _ in range(attempts):
+            await asyncio.sleep(delay)
+            if want and await self._served_cert_der() == want:
+                logger.info("[cert] WebGUI on %s now serves the new cert", self.host)
+                return True
+        logger.warning("[cert] WebGUI on %s still serves the previous cert after restart", self.host)
+        return False
 
     @staticmethod
     def _write_failure(res: Any) -> Optional[str]:
