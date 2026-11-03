@@ -51,7 +51,7 @@ class OpnsenseEngine:
                            "skipping API calls until then.")
 
     async def _request(self, method: str, endpoint: str, data: Dict = None,
-                       timeout: int = 15) -> Dict[str, Any]:
+                       timeout: int = 15, raw: bool = False) -> Dict[str, Any]:
         """Internal helper to handle OPNsense API requests using system curl.
         Bypasses Python network stack issues that cause ConnectError while system curl works.
 
@@ -132,6 +132,8 @@ class OpnsenseEngine:
             result_text = stdout.decode().strip()
             if not result_text:
                 return {"status": "ERROR", "message": "Empty response from server"}
+            if raw:
+                return {"raw": result_text}
 
             result = json.loads(result_text)
             logger.debug(f"API request to {url} succeeded. Response keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
@@ -838,16 +840,53 @@ class OpnsenseEngine:
             return None
         return OpnsenseEngine._pem_to_der(pem)
 
-    async def _webgui_cert_row(self) -> Optional[Tuple[Dict[str, Any], bool]]:
-        """Return ``(trust row, self_signed)`` for the cert the WebGUI serves,
-        or ``None`` if it can't be matched to a Trust object."""
+    async def _webgui_certref(self) -> Optional[str]:
+        """``system/webgui/ssl-certref`` from the latest config backup — the
+        authoritative WebGUI cert assignment (no dedicated API exists). The
+        config holds secrets: only this one element is parsed, nothing logged."""
+        res = await self._request("GET", "/api/core/backup/download/this", raw=True)
+        text = (res or {}).get("raw") if isinstance(res, dict) else None
+        if not text:
+            logger.info("[cert] could not read config from %s to find the WebGUI cert: %s",
+                        self.host, (res or {}).get("message") if isinstance(res, dict) else res)
+            return None
+        m = re.search(r"<webgui>.*?<ssl-certref>\s*([^<\s]+)\s*</ssl-certref>.*?</webgui>", text, re.DOTALL)
+        return m.group(1) if m else None
+
+    async def _webgui_cert_row(self, heal: bool = True) -> Optional[Tuple[Dict[str, Any], bool]]:
+        """Return ``(trust row, self_signed)`` for the WebGUI's cert, or ``None``.
+        Primary: the config's ``ssl-certref`` matched to a Trust row's refid
+        (works even when the live cert is stale, e.g. an HA backup whose cert
+        store was replaced by sync). Fallback: the live TLS cert fingerprint."""
+        certref = await self._webgui_certref()
+        rows = await self._trust_cert_rows() if certref else None
+        if certref:
+            for row in rows:
+                if row.get("refid") == certref:
+                    der = self._row_der(row)
+                    return row, bool(der and self._der_self_signed(der))
+            logger.info("[cert] WebGUI on %s is assigned cert refid %s, which is not in Trust "
+                        "(e.g. replaced by HA sync)", self.host, certref)
         served = await self._served_cert_der()
         if not served:
             return None
-        for row in await self._trust_cert_rows():
+        if rows is None:
+            rows = await self._trust_cert_rows()
+        for row in rows:
             if self._row_der(row) == served:
                 return row, self._der_self_signed(served)
         logger.info("[cert] WebGUI cert on %s matches no Trust certificate", self.host)
+        if heal and certref is not None:
+            # Orphaned assignment: restarting the WebGUI makes OPNsense create
+            # a fresh self-signed cert in Trust and re-point ssl-certref at it,
+            # which the caller can then replace in place.
+            logger.info("[cert] restarting the WebGUI on %s to repair its cert assignment", self.host)
+            await self._request("POST", "/api/core/service/restart/webgui", data={})
+            for _ in range(10):
+                await asyncio.sleep(3)
+                if await self._served_cert_der() not in (None, served):
+                    break
+            return await self._webgui_cert_row(heal=False)
         return None
 
     @staticmethod
@@ -920,12 +959,12 @@ class OpnsenseEngine:
     async def import_ca(self, descr: str, ca_pem: str) -> Dict[str, Any]:
         """Import a CA certificate into Trust→Authorities (idempotent via search
         by ``descr`` → ``/set/<uuid>`` else ``/add``). Payload nested under
-        ``"ca"``: ``action:"import"``, ``descr``, ``crt_payload`` (raw PEM). Needed
+        ``"ca"``: ``action:"existing"``, ``descr``, ``crt_payload`` (raw PEM). Needed
         before importing a leaf whose signing CA isn't already trusted, else
         OPNsense errors "missing CA key"."""
         if not ca_pem:
             return {"status": "ERROR", "message": "import_ca requires a CA PEM"}
-        payload = {"action": "import", "descr": descr, "crt_payload": ca_pem}
+        payload = {"action": "existing", "descr": descr, "crt_payload": ca_pem}
         uuid = await self._find_ca_uuid(descr)
         if uuid:
             res = await self._request("POST", f"/api/trust/ca/set/{uuid}",
