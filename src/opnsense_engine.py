@@ -842,16 +842,21 @@ class OpnsenseEngine:
 
     async def _webgui_certref(self) -> Optional[str]:
         """``system/webgui/ssl-certref`` from the latest config backup — the
-        authoritative WebGUI cert assignment (no dedicated API exists). The
-        config holds secrets: only this one element is parsed, nothing logged."""
+        authoritative WebGUI cert assignment (no dedicated API exists). Returns
+        ``None`` if the config can't be read, ``""`` if nothing is assigned.
+        The config holds secrets: only this one element is parsed, nothing logged."""
         res = await self._request("GET", "/api/core/backup/download/this", raw=True)
         text = (res or {}).get("raw") if isinstance(res, dict) else None
         if not text:
             logger.info("[cert] could not read config from %s to find the WebGUI cert: %s",
                         self.host, (res or {}).get("message") if isinstance(res, dict) else res)
             return None
-        m = re.search(r"<webgui>.*?<ssl-certref>\s*([^<\s]+)\s*</ssl-certref>.*?</webgui>", text, re.DOTALL)
-        return m.group(1) if m else None
+        m = re.search(r"<webgui>.*?<ssl-certref>\s*([^<\s]*)\s*</ssl-certref>.*?</webgui>", text, re.DOTALL)
+        if not (m and m.group(1)):
+            # Readable config, no assignment: "" (heal-able), not None (unknown).
+            logger.info("[cert] WebGUI on %s has no ssl-certref assigned in config", self.host)
+            return ""
+        return m.group(1)
 
     async def _webgui_cert_row(self, heal: bool = True) -> Optional[Tuple[Dict[str, Any], bool]]:
         """Return ``(trust row, self_signed)`` for the WebGUI's cert, or ``None``.
@@ -877,8 +882,9 @@ class OpnsenseEngine:
                 return row, self._der_self_signed(served)
         logger.info("[cert] WebGUI cert on %s matches no Trust certificate", self.host)
         if heal and certref is not None:
-            # Orphaned assignment: restarting the WebGUI makes OPNsense create
-            # a fresh self-signed cert in Trust and re-point ssl-certref at it,
+            # Missing/orphaned assignment: on restart OPNsense's
+            # webgui_configure_do() finds no cert for ssl-certref, creates a
+            # "Web GUI TLS certificate" in Trust and assigns it (write_config),
             # which the caller can then replace in place.
             logger.info("[cert] restarting the WebGUI on %s to repair its cert assignment", self.host)
             await self._request("POST", "/api/core/service/restart/webgui", data={})
