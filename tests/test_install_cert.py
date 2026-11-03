@@ -49,6 +49,10 @@ def _make_engine(responses):
         return responses.get(base, {"status": "ERROR", "message": "not found"})
 
     eng._request = fake_request
+
+    async def no_served_cert():
+        return None
+    eng._served_cert_der = no_served_cert
     return eng, calls
 
 
@@ -169,7 +173,7 @@ def test_import_cert_existing_updates_in_place():
     })
     res = _run(eng.import_cert("example.com", _FULLCHAIN, _KEY))
     assert res["status"] == "SUCCESS"
-    assert res["message"] == "cert 'example.com' updated"
+    assert res["message"].startswith("cert 'example.com' updated")
     # No cert add call happened (CA add still happens, best-effort).
     assert _cert_call(calls, "/api/trust/cert/add") is None
     set_call = next((c for c in calls if c["endpoint"].endswith("/cert/set/cert-uuid-1")), None)
@@ -187,7 +191,7 @@ def test_import_cert_search_descr_mismatch_falls_to_add():
     })
     res = _run(eng.import_cert("example.com", _FULLCHAIN, _KEY))
     assert res["status"] == "SUCCESS"
-    assert res["message"] == "cert 'example.com' added"
+    assert res["message"].startswith("cert 'example.com' added")
     assert _cert_call(calls, "/api/trust/cert/add") is not None
 
 
@@ -358,3 +362,77 @@ def test_request_verifies_tls_when_opted_in(monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     _run(eng._request("GET", "/api/test"))
     assert "-k" not in seen["args"]
+
+
+def _real_pem():
+    """A real self-signed cert (the WebGUI factory cert stand-in)."""
+    import subprocess, tempfile
+    d = tempfile.mkdtemp()
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-subj", "/CN=OPNsense.localdomain", "-keyout", f"{d}/k", "-out", f"{d}/c"],
+                   check=True, capture_output=True)
+    return open(f"{d}/c").read()
+
+
+def _webgui_engine(served_pem, rows, extra=None):
+    import base64
+    from opnsense_engine import OpnsenseEngine as E
+    responses = {**_CA_OK, "/api/trust/cert/search": {"rows": [
+        {**r, "crt": base64.b64encode(r.pop("_pem").encode()).decode()} for r in rows]},
+        **(extra or {})}
+    eng, calls = _make_engine(responses)
+    state = {"served": E._pem_to_der(served_pem)}
+
+    async def served():
+        return state["served"]
+    eng._served_cert_der = served
+    return eng, calls, state
+
+
+def test_activation_replaces_self_signed_webgui_cert_in_place(monkeypatch):
+    """The WebGUI's self-signed cert object is overwritten via set/<uuid>
+    (keeps its refid → WebGUI assignment), then the webgui is restarted."""
+    selfsigned = _real_pem()
+    eng, calls, state = _webgui_engine(selfsigned, [
+        {"uuid": "gui", "descr": "Web GUI TLS certificate", "commonname": "OPNsense.localdomain",
+         "in_use": "1", "_pem": selfsigned}],
+        {"/api/trust/cert/set/gui": {"result": "saved"},
+         "/api/core/service/restart/webgui": {"result": "ok"}})
+    monkeypatch.setattr(eng, "_restart_webgui_and_verify",
+                        lambda leaf, **k: _done(True))
+    res = _run(eng.import_cert("example.com", _FULLCHAIN, _KEY))
+    assert res["status"] == "SUCCESS"
+    assert "activated on the WebGUI" in res["message"]
+    assert _cert_call(calls, "/api/trust/cert/set/gui") is not None
+    assert _cert_call(calls, "/api/trust/cert/add") is None
+
+
+def test_activation_leaves_foreign_ca_signed_webgui_cert(monkeypatch):
+    other = _real_pem()
+    eng, calls, _ = _webgui_engine(other, [
+        {"uuid": "corp", "descr": "corp cert", "commonname": "fw.corp", "_pem": other}],
+        {"/api/trust/cert/add": {"result": "saved"}})
+    monkeypatch.setattr(OpnsenseEngine, "_der_self_signed", staticmethod(lambda der: False))
+    res = _run(eng.import_cert("example.com", _FULLCHAIN, _KEY))
+    assert res["status"] == "SUCCESS"
+    assert "not activated" in res["message"]
+    assert _cert_call(calls, "/api/trust/cert/set/corp") is None
+
+
+async def _done(v):
+    return v
+
+
+def test_restart_webgui_verifies_new_cert_served():
+    old, new = _real_pem(), _real_pem()
+    eng, calls, state = _webgui_engine(old, [], {"/api/core/service/restart/webgui": {"result": "ok"}})
+
+    real_request = eng._request
+
+    async def req(method, endpoint, data=None, timeout=15):
+        if endpoint.endswith("/restart/webgui"):
+            state["served"] = OpnsenseEngine._pem_to_der(new)
+        return await real_request(method, endpoint, data, timeout)
+    eng._request = req
+    assert _run(eng._restart_webgui_and_verify(new, attempts=2, delay=0)) is True
+    assert any(c["endpoint"].endswith("/restart/webgui") for c in calls)
