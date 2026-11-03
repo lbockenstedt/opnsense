@@ -436,3 +436,30 @@ def test_restart_webgui_verifies_new_cert_served():
     eng._request = req
     assert _run(eng._restart_webgui_and_verify(new, attempts=2, delay=0)) is True
     assert any(c["endpoint"].endswith("/restart/webgui") for c in calls)
+
+
+def test_install_cert_on_every_bound_firewall(monkeypatch, caplog):
+    """Hub-supplied ``devices`` (an HA pair) each get the cert directly; one
+    failing box makes the target ERROR (sweep retries) with a per-device report,
+    and secrets never reach the log."""
+    import logging
+    import opn_spoke
+    hosts = []
+
+    async def fake_import(self, domain, fullchain, privkey):
+        hosts.append(self.host)
+        if self.host.startswith("10.0.0.2"):
+            return {"status": "ERROR", "message": "boom"}
+        return {"status": "SUCCESS", "message": f"cert '{domain}' updated; activated on the WebGUI"}
+    monkeypatch.setattr(opn_spoke.OpnsenseEngine, "import_cert", fake_import)
+    spoke = opn_spoke.OpnSpoke("s", {})
+    caplog.set_level(logging.DEBUG)
+    res = _run(spoke.handle_command("INSTALL_CERT", {
+        "domain": "example.com", "fullchain": _FULLCHAIN, "privkey": _KEY,
+        "devices": [
+            {"name": "FW1", "host": "10.0.0.1", "port": 443, "api_key": "k", "api_secret": "TOPSECRET"},
+            {"name": "FW2", "host": "10.0.0.2", "port": 443, "api_key": "k", "api_secret": "TOPSECRET"}]}))
+    assert sorted(hosts) == ["10.0.0.1:443", "10.0.0.2:443"]
+    assert res["status"] == "ERROR" and res["message"].startswith("1/2 firewall(s)")
+    assert {d["name"]: d["status"] for d in res["devices"]} == {"FW1": "SUCCESS", "FW2": "ERROR"}
+    assert "TOPSECRET" not in caplog.text
