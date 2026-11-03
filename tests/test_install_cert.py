@@ -302,3 +302,39 @@ def test_request_keeps_credentials_out_of_curl_argv_by_default(monkeypatch):
     assert seen["cfg_mode"] == 0o600
     assert seen["cfg_text"] == 'user = "k:s"\n'
     assert not os.path.exists(seen["cfg_path"])
+
+
+def test_import_cert_validation_failure_is_error():
+    """OPNsense rejects a model write with HTTP 200 + result=failed/validations;
+    that must surface as ERROR (not a false SUCCESS the hub never retries)."""
+    eng, _ = _make_engine({
+        **_CA_OK,
+        "/api/trust/cert/search": {"rows": []},
+        "/api/trust/cert/add": {"result": "failed",
+                                "validations": {"cert.prv_payload": "Invalid private key"}},
+    })
+    res = _run(eng.import_cert("example.com", _FULLCHAIN, _KEY))
+    assert res["status"] == "ERROR"
+    assert "Invalid private key" in res["message"]
+
+
+def test_import_ca_validation_failure_reported():
+    eng, _ = _make_engine({
+        "/api/trust/ca/search": {"rows": []},
+        "/api/trust/ca/add": {"result": "failed", "validations": {"ca.crt_payload": "bad"}},
+    })
+    res = _run(eng.import_ca("lm-le-x-ca", _INTER))
+    assert res["status"] == "ERROR"
+    assert "bad" in res["message"]
+
+
+def test_cert_search_sends_search_phrase():
+    """OPNsense grid search endpoints filter on ``searchPhrase``."""
+    eng, calls = _make_engine({
+        **_CA_OK,
+        "/api/trust/cert/search": {"rows": []},
+        "/api/trust/cert/add": {"result": "saved", "uuid": "u1"},
+    })
+    _run(eng.import_cert("example.com", _FULLCHAIN, _KEY))
+    search = _cert_call(calls, "/api/trust/cert/search")
+    assert search["data"]["searchPhrase"] == "example.com"
