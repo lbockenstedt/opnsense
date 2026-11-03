@@ -851,6 +851,7 @@ class OpnsenseEngine:
             logger.info("[cert] could not read config from %s to find the WebGUI cert: %s",
                         self.host, (res or {}).get("message") if isinstance(res, dict) else res)
             return None
+        self._config_diag = self._config_summary(text)
         m = re.search(r"<webgui>.*?<ssl-certref>\s*([^<\s]*)\s*</ssl-certref>.*?</webgui>", text, re.DOTALL)
         if not (m and m.group(1)):
             # Readable config, no assignment: "" (heal-able), not None (unknown).
@@ -881,6 +882,7 @@ class OpnsenseEngine:
             if self._row_der(row) == served:
                 return row, self._der_self_signed(served)
         logger.info("[cert] WebGUI cert on %s matches no Trust certificate", self.host)
+        self._log_webgui_diag(served, rows)
         if heal and certref is not None:
             # Missing/orphaned assignment: on restart OPNsense's
             # webgui_configure_do() finds no cert for ssl-certref, creates a
@@ -894,6 +896,27 @@ class OpnsenseEngine:
                     break
             return await self._webgui_cert_row(heal=False)
         return None
+
+    @staticmethod
+    def _config_summary(text: str) -> str:
+        """Non-secret config excerpt for diagnostics: revision, webgui block and
+        HA sync settings, with any password/key/secret elements removed."""
+        def block(tag: str) -> str:
+            m = re.search(rf"<{tag}>.*?</{tag}>", text, re.DOTALL)
+            return m.group(0) if m else f"<{tag}/>(absent)"
+        out = " ".join(block(t) for t in ("revision", "webgui", "hasync"))
+        out = re.sub(r"<([\w-]*(?:pass|secret|key|prv)[\w-]*)>.*?</\1>", r"<\1>***</\1>", out,
+                     flags=re.DOTALL | re.IGNORECASE)
+        return re.sub(r"\s+", " ", out)[:1500]
+
+    def _log_webgui_diag(self, served: Optional[bytes], rows: List[Dict[str, Any]]) -> None:
+        import hashlib
+        fp = lambda d: hashlib.sha256(d).hexdigest()[:16] if d else None  # noqa: E731
+        logger.info("[cert] diag %s config: %s", self.host, getattr(self, "_config_diag", "n/a"))
+        logger.info("[cert] diag %s served sha256=%s self_signed=%s; trust rows: %s", self.host,
+                    fp(served), served and self._der_self_signed(served),
+                    [(r.get("descr"), r.get("refid"), r.get("commonname"), r.get("in_use"),
+                      fp(self._row_der(r))) for r in rows])
 
     @staticmethod
     def _der_self_signed(der: bytes) -> bool:
