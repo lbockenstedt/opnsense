@@ -298,7 +298,7 @@ def test_request_keeps_credentials_out_of_curl_argv_by_default(monkeypatch):
     assert res == {"status": "ok"}
     assert "-u" not in seen["args"]
     assert "k:s" not in " ".join(seen["args"])
-    assert "-k" not in seen["args"]
+    assert "-k" in seen["args"]  # verify is opt-in (fleet convention)
     assert seen["cfg_mode"] == 0o600
     assert seen["cfg_text"] == 'user = "k:s"\n'
     assert not os.path.exists(seen["cfg_path"])
@@ -338,3 +338,23 @@ def test_cert_search_sends_search_phrase():
     _run(eng.import_cert("example.com", _FULLCHAIN, _KEY))
     search = _cert_call(calls, "/api/trust/cert/search")
     assert search["data"]["searchPhrase"] == "example.com"
+
+
+def test_request_verifies_tls_when_opted_in(monkeypatch):
+    eng = OpnsenseEngine(host="fw:8443", api_key="k", api_secret="s")
+    seen = {}
+
+    class _FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b'{"status":"ok"}', b"")
+
+    async def fake_exec(*args, **kwargs):
+        seen["args"] = args
+        return _FakeProc()
+
+    monkeypatch.setenv("LM_OPNSENSE_VERIFY_TLS", "1")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    _run(eng._request("GET", "/api/test"))
+    assert "-k" not in seen["args"]
