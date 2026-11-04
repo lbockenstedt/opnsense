@@ -263,6 +263,80 @@ class OpnsenseEngine:
             return {"status": "ERROR", "details": res}
         return {"status": "SUCCESS", "data": res}
 
+    async def get_overview(self) -> Dict[str, Any]:
+        """Dashboard snapshot (like the OPNsense lobby): host/version/uptime,
+        CPU, memory, gateway (WAN) status and per-interface throughput.
+
+        Each section is best-effort — a missing API privilege blanks that
+        section instead of failing the whole overview. Throughput is the byte
+        counter delta between two traffic samples taken around the other calls
+        (the activity call runs ``top`` for ~2s, so the window is real)."""
+        def ok(res):
+            return isinstance(res, dict) and res.get("status") != "ERROR"
+
+        def num(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        traffic_before = await self._request("GET", "/api/diagnostics/traffic/interface")
+        info, uptime, resources, activity, gateways = await asyncio.gather(
+            self._request("GET", "/api/diagnostics/system/system_information"),
+            self._request("GET", "/api/diagnostics/system/system_time"),
+            self._request("GET", "/api/diagnostics/system/system_resources"),
+            self._request("GET", "/api/diagnostics/activity/get_activity"),
+            self._request("GET", "/api/routes/gateway/status"),
+        )
+        traffic_after = await self._request("GET", "/api/diagnostics/traffic/interface")
+
+        if not any(ok(r) for r in (info, uptime, resources, activity, gateways, traffic_after)):
+            return {"status": "ERROR", "message": info.get("message", "Firewall unreachable")}
+
+        overview = {"hostname": "", "version": "", "uptime": "", "loadavg": "",
+                    "cpu_percent": None, "memory": {}, "gateways": [], "interfaces": []}
+        if ok(info):
+            overview["hostname"] = info.get("name", "")
+            overview["version"] = (info.get("versions") or [""])[0]
+        if ok(uptime):
+            overview["uptime"] = uptime.get("uptime", "")
+            overview["loadavg"] = uptime.get("loadavg", "")
+        if ok(activity):
+            # top header: "CPU:  2.1% user, 0.0% nice, 1.3% system, 0.2% interrupt, 96.4% idle"
+            for line in activity.get("headers") or []:
+                idle = re.search(r"CPU:.*?([\d.]+)% idle", line)
+                if idle:
+                    overview["cpu_percent"] = round(100 - float(idle.group(1)), 1)
+        memory = resources.get("memory") if ok(resources) else None
+        if isinstance(memory, dict):
+            used, total = num(memory.get("used")), num(memory.get("total"))
+            if used is not None and total:
+                overview["memory"] = {"used": used, "total": total,
+                                      "percent": round(used * 100 / total, 1)}
+        if ok(gateways):
+            for gw in gateways.get("items") or []:
+                overview["gateways"].append({
+                    "name": gw.get("name", ""),
+                    "address": gw.get("address", ""),
+                    "status": gw.get("status_translated") or gw.get("status", ""),
+                    "online": gw.get("status") == "none",
+                    "delay": gw.get("delay", ""),
+                    "loss": gw.get("loss", ""),
+                })
+        if ok(traffic_before) and ok(traffic_after):
+            seconds = (num(traffic_after.get("time")) or 0) - (num(traffic_before.get("time")) or 0)
+            before = traffic_before.get("interfaces") or {}
+            for key, now in (traffic_after.get("interfaces") or {}).items():
+                prev = before.get(key)
+                if not isinstance(now, dict) or not isinstance(prev, dict) or seconds <= 0:
+                    continue
+                rates = {}
+                for field, label in (("bytes received", "in_bps"), ("bytes transmitted", "out_bps")):
+                    delta = (num(now.get(field)) or 0) - (num(prev.get(field)) or 0)
+                    rates[label] = max(0, round(delta * 8 / seconds))
+                overview["interfaces"].append({"name": now.get("name") or key, **rates})
+        return {"status": "SUCCESS", "data": overview}
+
     async def get_all_firewall_rules(self) -> Dict[str, Any]:
         """Fetches all firewall rules across all interfaces."""
         res = await self._request("POST", "/api/firewall/filter/search_rule", data={})
