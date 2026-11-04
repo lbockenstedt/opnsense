@@ -326,6 +326,10 @@ class OpnSpoke(BaseSpoke):
         elif normalized_cmd == "GET_SYSTEM_HEALTH":
             return self._cache_live(normalized_cmd, await self.engine.get_system_health())
 
+        elif normalized_cmd == "OPNSENSE_GET_OVERVIEW":
+            # Live dashboard stats; the hub cache already bounds how often this runs.
+            return await self.engine.get_overview()
+
         elif normalized_cmd == "OPNSENSE_GET_RULES_BY_IP":
             # Reuse the cached OPNSENSE_GET_ALL_RULES result when present
             # instead of re-fetching the whole ruleset (a fresh curl) per
