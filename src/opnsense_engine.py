@@ -475,8 +475,10 @@ class OpnsenseEngine:
                     dest_port = r.get("destination_port", "")
                     destination = f"{dest_net}:{dest_port}" if dest_port else dest_net
 
-                    # Source network/IP
-                    source = r.get("source", "any")
+                    # OPNsense names the source "source_net", mirroring "destination_net"
+                    src_net = r.get("source_net") or r.get("source") or "any"
+                    src_port = r.get("source_port", "")
+                    source = f"{src_net}:{src_port}" if src_port else src_net
 
                     final_rules.append({
                         "id": r.get("uuid", "unknown"),
