@@ -1,3 +1,9 @@
+"""OPNsense spoke: runs on the firewall host and turns hub commands into OPNsense API calls.
+
+It caches read-heavy API responses, refreshes them in the background, and
+handles certificate installs and network impairment commands.
+"""
+# Standard library, the shared base spoke, the engine and impairments.
 import logging
 import subprocess
 import time
@@ -6,6 +12,7 @@ from core.src.base_spoke import BaseSpoke
 from opnsense_engine import OpnsenseEngine
 import impairments
 
+# Module logger.
 logger = logging.getLogger("OpnSpoke")
 
 # Hub-level system commands handled by BaseControlPlane.handle_system_command
@@ -17,6 +24,7 @@ logger = logging.getLogger("OpnSpoke")
 # spoke clearly can't honour it until its core updates, so ack success and let
 # the next SPOKE_UPDATE pull current core. Only system commands are muted here;
 # genuinely-unknown MODULE commands still WARN + ERROR (so typos surface).
+# System commands the base control plane handles; acked quietly if an old core misses one.
 _SYSTEM_COMMANDS = frozenset({
     "HUB_PING", "RUN_COMMAND", "GET_AGENTS",
     "SPOKE_SET_LOG_LEVEL", "SET_LOG_LEVEL", "CLEAR_LOGS",
@@ -39,10 +47,13 @@ class OpnSpoke(BaseSpoke):
         # api_secret through UPDATE_CONFIG). Until a host is configured the
         # engine is UNCONFIGURED and every API call short-circuits with
         # "no firewall configured" instead of connecting to localhost:8443.
+        """Build the engine from config, set up the cache, then start the base spoke."""
+        # Host and port from config; no host means unconfigured.
         host = config.get("opn_host") or config.get("host")
         port = config.get("opn_port") or config.get("port")
         combined_host = f"{host}:{port or 8443}" if host else None
 
+        # The OPNsense API client.
         self.engine = OpnsenseEngine(
             host=combined_host,
             api_key=config.get("api_key"),
@@ -50,6 +61,7 @@ class OpnSpoke(BaseSpoke):
         )
 
         # Caching and Scheduling
+        # Cached responses.
         self._cache = {}
         # Per-key store timestamp (epoch seconds) for TTL-bounded reads. The
         # persistent read-cache is refreshed by the 1h loop AND filled by every
@@ -57,23 +69,28 @@ class OpnSpoke(BaseSpoke):
         # was last stored — up to 1h stale after an add/delete. Reads are now
         # capped at _cache_ttl (like DHCP leases, which are served live) and
         # write handlers pop the affected GET keys for immediate freshness.
+        # Per-key timestamps, read TTL and refresh interval.
         self._cache_ts = {}
         self._cache_ttl = config.get("cache_ttl", 60)  # seconds; cap read staleness
         self._refresh_interval = config.get("refresh_interval", 3600) # seconds, default 1h
         self._refresh_task = None
 
+        # Start the base spoke, then the refresh loop.
         super().__init__(spoke_id, config)
         self._start_refresh_loop()
 
     def _start_refresh_loop(self):
         """Starts the background cache refresh task."""
+        # Cancel any running loop.
         if self._refresh_task:
             self._refresh_task.cancel()
+        # Start a new loop task if an event loop is running.
         import asyncio
         try:
             self._refresh_task = asyncio.create_task(self._cache_refresh_loop())
         except RuntimeError:
             # Fallback if the loop isn't running yet during initialization
+            # No loop yet.
             logger.warning("Event loop not running; refresh loop will be started manually or on first request")
 
     async def _cache_refresh_loop(self):
@@ -85,19 +102,25 @@ class OpnSpoke(BaseSpoke):
         live fetch probes 3 endpoints sequentially) to a slow live round-trip
         that blew the hub's request_response budget and rendered the tab empty.
         """
+        # Prime the cache once at startup.
         try:
             logger.info("Priming OPNsense cache on startup")
             await self.refresh_cache()
         except Exception as e:
+            # Priming failed.
             logger.error(f"Initial OPNsense cache refresh failed: {e}")
+        # Then refresh every interval until cancelled.
         while True:
             try:
+                # Sleep, then refresh.
                 await asyncio.sleep(self._refresh_interval)
                 logger.debug(f"Performing scheduled OPNsense cache refresh (interval: {self._refresh_interval}s)")
                 await self.refresh_cache()
             except asyncio.CancelledError:
+                # Stopped.
                 break
             except Exception as e:
+                # Log and wait a minute before retrying.
                 logger.error(f"Error in OPNsense cache refresh loop: {e}")
                 await asyncio.sleep(60) # Wait before retry on error
 
@@ -106,9 +129,11 @@ class OpnSpoke(BaseSpoke):
         # No firewall configured → nothing to refresh. Skip the whole sweep so
         # an unconfigured spoke doesn't emit per-endpoint / [sync-error] noise;
         # _log_unconfigured throttles the single "no firewall configured" line.
+        # Unconfigured: nothing to refresh.
         if not self.engine.is_configured():
             self.engine._log_unconfigured()
             return {}
+        # Commands to cache and the engine method for each.
         cache_map = {
             "GET_INTERFACE_STATUS": self.engine.get_interface_status,
             "GET_SYSTEM_HEALTH": self.engine.get_system_health,
@@ -125,9 +150,11 @@ class OpnSpoke(BaseSpoke):
             "OPNSENSE_GET_ALIASES": self.engine.get_all_aliases,
         }
 
+        # Refresh each; one failure does not stop the rest.
         results = {}
         for cmd, method in cache_map.items():
             try:
+                # Call the method.
                 res = await method()
                 # Only cache if the result was a success
                 if isinstance(res, dict) and res.get("status") == "SUCCESS":
@@ -135,20 +162,25 @@ class OpnSpoke(BaseSpoke):
                     self._cache_ts[cmd] = time.time()
                     results[cmd] = "OK"
                 else:
+                    # Not cached: note the error.
                     results[cmd] = f"Error: {res.get('message') if isinstance(res, dict) else res}"
             except Exception as e:
+                # Method raised.
                 logger.error(f"Failed to refresh cache for {cmd}: {e}")
                 results[cmd] = f"Exception: {str(e)}"
 
+        # Per-command results.
         return {"status": "SUCCESS", "refreshed": results}
 
     def _cache_live(self, cmd: str, res: Dict[str, Any]) -> Dict[str, Any]:
         """Store a live-fetched cacheable result so the next call hits the cache
         instead of re-doing the slow live round-trip. Only caches SUCCESS (mirrors
         refresh_cache). Best-effort: returns ``res`` unchanged regardless."""
+        # Store only successes, with a timestamp.
         if isinstance(res, dict) and res.get("status") == "SUCCESS":
             self._cache[cmd] = res
             self._cache_ts[cmd] = time.time()
+        # Pass the result through.
         return res
 
     def _cache_get_fresh(self, key: str):
@@ -156,43 +188,60 @@ class OpnSpoke(BaseSpoke):
         ``_cache_ttl``; otherwise ``None`` (caller should fetch live). Bounds how
         stale a read can be — the refresh loop (1h) and _cache_live populate the
         cache, and without this the read served arbitrarily old data."""
+        # Fresh enough?
         if key in self._cache and (time.time() - self._cache_ts.get(key, 0)) < self._cache_ttl:
             return self._cache[key]
+        # Missing or stale.
         return None
 
     def _invalidate_on_write(self, res: Dict[str, Any], keys) -> Dict[str, Any]:
         """After a successful write, drop the cached GET responses it affects so
         the next read re-fetches live instead of serving the pre-change list for
         up to the refresh interval. Best-effort: returns ``res`` unchanged."""
+        # Drop the affected keys after a successful write.
         if isinstance(res, dict) and res.get("status") == "SUCCESS":
             for k in keys:
                 self._cache.pop(k, None)
                 self._cache_ts.pop(k, None)
+        # Pass the result through.
         return res
 
     async def _install_cert_on_devices(self, data: Dict[str, Any], devices: list) -> Dict[str, Any]:
+        """Import a certificate on each listed firewall in parallel and summarise the results."""
+        # asyncio for gather.
         import asyncio
 
         async def one(d):
+            """Install the certificate on one firewall and return its result row."""
+            # Name and host:port.
             name = d.get("name") or d.get("host")
             host = f"{d['host']}:{d.get('port') or 8443}"
+            # Credentials are required.
             if not (d.get("api_key") and d.get("api_secret")):
                 return {"device_id": name, "name": name, "ip": host, "cert_capable": True,
                         "status": "ERROR", "message": "missing API key/secret"}
+            # A client for this firewall.
             eng = OpnsenseEngine(host=host, api_key=d["api_key"], api_secret=d["api_secret"])
+            # Import; an error becomes an ERROR row.
             try:
                 r = await eng.import_cert(data.get("domain", ""), data.get("fullchain", ""),
                                           data.get("privkey", ""))
             except Exception as e:  # noqa: BLE001 — one box must not sink the others
+                # Import failed.
                 r = {"status": "ERROR", "message": str(e)}
+            # Result row.
             return {"device_id": name, "name": name, "ip": host, "cert_capable": True,
                     "status": r.get("status"), "message": r.get("message")}
 
+        # Run all in parallel.
         results = await asyncio.gather(*(one(d) for d in devices))
+        # Successes.
         ok = [r for r in results if r["status"] == "SUCCESS"]
+        # Log each result.
         for r in results:
             logger.info("[cert] %s on %s (%s): %s — %s", data.get("domain"), r["name"],
                         r["ip"], r["status"], r["message"])
+        # Summary across all firewalls.
         summary = "; ".join(f"{r['name']}: {r['message']}" for r in results)
         return {"status": "SUCCESS" if len(ok) == len(results) else "ERROR",
                 "message": f"{len(ok)}/{len(results)} firewall(s) — {summary}",
@@ -219,23 +268,33 @@ class OpnSpoke(BaseSpoke):
         # hub), which is a meaningful fraction of a typical OPNsense API secret.
         _SENSITIVE = {"api_key", "api_secret", "password", "privkey", "private_key"}
         def _mask(v):
+            """Return a copy of ``v`` with sensitive dict values masked."""
+            # Dict: mask sensitive keys, recurse into the rest.
             if isinstance(v, dict):
                 return {k: ("********" if k in _SENSITIVE else _mask(x)) for k, x in v.items()}
+            # List: recurse.
             if isinstance(v, list):
                 return [_mask(x) for x in v]
+            # Anything else as-is.
             return v
+        # Masked copy for logging.
         log_data = _mask(data)
 
+        # Log the command.
         logger.debug(f"Handling Opn Command: {command_type} with data {log_data}")
 
         if normalized_cmd == "UPDATE_CONFIG":
+            # Store the new config.
             logger.info(f"Updating OPNsense configuration: {log_data}")
             self.config = data
             # Update engine credentials if they are provided
+            # Connection fields given: update the engine.
             if any(k in data for k in ["opn_host", "host", "opn_port", "port", "api_key", "api_secret"]):
+                # Current host and port.
                 cur_host = self.engine.host or ""
                 cur_h = cur_host.split(':')[0] if ':' in cur_host else (cur_host or None)
                 cur_p = cur_host.split(':')[1] if ':' in cur_host else "8443"
+                # New host and port, falling back to current values.
                 host = data.get("opn_host") or data.get("host") or cur_h
                 port = str(data.get("opn_port") or data.get("port") or cur_p)
                 # Stay unconfigured (host=None) until a real host is supplied —
@@ -250,18 +309,23 @@ class OpnSpoke(BaseSpoke):
                 self.engine.api_secret = data.get("api_secret") or self.engine.api_secret
 
             # Update refresh interval and restart loop if provided
+            # New refresh interval: apply and restart the loop.
             if "refresh_interval" in data:
+                # Only numbers.
                 new_interval = data.get("refresh_interval")
                 if isinstance(new_interval, (int, float)):
                     self._refresh_interval = new_interval
                     logger.info(f"Updating OPNsense refresh interval to {new_interval}s")
                     self._start_refresh_loop()
 
+            # Done.
             return {"status": "SUCCESS", "message": "OPNsense configuration updated from Hub"}
 
+        # Spoke version.
         if normalized_cmd == "GET_VERSION":
             return {"status": "SUCCESS", "version": self.get_version()}
 
+        # Manual cache refresh.
         if normalized_cmd == "OPNSENSE_REFRESH_CACHE":
             logger.info("Manual OPNsense cache refresh triggered")
             return await self.refresh_cache()
@@ -272,10 +336,13 @@ class OpnSpoke(BaseSpoke):
         # cached value (LLM payload guard preserved).
         if (normalized_cmd == "OPNSENSE_GET_DHCP_LEASES"
                 and isinstance(data, dict) and data.get("limit") is not None):
+            # Parse the limit; default 200.
             try:
                 limit = int(data.get("limit", 200))
             except (TypeError, ValueError):
+                # Bad limit.
                 limit = 200
+            # Live, full lease list.
             return await self.engine.get_dhcp_leases(limit=limit)
 
         # Check if command is cacheable and has a cached value
@@ -301,6 +368,7 @@ class OpnSpoke(BaseSpoke):
         }
 
         if normalized_cmd in cache_map:
+            # Serve a fresh cached copy if there is one.
             fresh = self._cache_get_fresh(normalized_cmd)
             if fresh is not None:
                 logger.debug(f"Returning cached data for {normalized_cmd}")
@@ -309,6 +377,7 @@ class OpnSpoke(BaseSpoke):
             # re-caches via _cache_live). Nothing older than _cache_ttl is served.
 
         if normalized_cmd == "PROBE_API":
+            # Raw GET of a given API path.
             path = data.get("path")
             if not path:
                 return {"status": "ERROR", "message": "Missing path for PROBE_API"}
@@ -316,14 +385,17 @@ class OpnSpoke(BaseSpoke):
 
         if normalized_cmd == "OPNSENSE_UPDATE_ALIAS":
             # Data expected: {"name": "web_servers", "hosts": ["1.1.1.1", "2.2.2.2"]}
+            # Replace an alias's hosts, then drop the cached alias list.
             return self._invalidate_on_write(
                 await self.engine.manage_alias(data.get("name"), data.get("hosts"), action="update"),
                 ["OPNSENSE_GET_ALIASES"])
 
         elif normalized_cmd == "GET_INTERFACE_STATUS":
+            # Live interface status, cached.
             return self._cache_live(normalized_cmd, await self.engine.get_interface_status())
 
         elif normalized_cmd == "GET_SYSTEM_HEALTH":
+            # Live system health, cached.
             return self._cache_live(normalized_cmd, await self.engine.get_system_health())
 
         elif normalized_cmd == "OPNSENSE_GET_OVERVIEW":
@@ -336,18 +408,22 @@ class OpnSpoke(BaseSpoke):
             # IP query — the all-rules fetch already runs on the 1h refresh
             # loop, so a per-IP lookup was paying a full ruleset round-trip
             # for nothing. Fall back to a live fetch if the cache is cold.
+            # Filter the cached ruleset by IP.
             ip = data.get("ip", "")
             cached_rules = self._cache_get_fresh("OPNSENSE_GET_ALL_RULES")
             if cached_rules and cached_rules.get("status") == "SUCCESS":
                 rules = cached_rules.get("data", [])
+                # Guard against a non-list.
                 if not isinstance(rules, list):
                     rules = []
+                # Rules whose source or destination mentions the IP.
                 filtered = [
                     r for r in rules
                     if ip in str(r.get("source", "")) or ip in str(r.get("destination", ""))
                 ]
                 return {"status": "SUCCESS", "ip": ip, "rules": filtered,
                         "source": "cache"}
+            # Cache cold: live lookup.
             return await self.engine.get_rules_for_ip(ip)
 
         elif normalized_cmd == "OPNSENSE_CURL_TEST":
@@ -362,11 +438,14 @@ class OpnSpoke(BaseSpoke):
                     "exit_code": result.returncode
                 }
             except Exception as e:
+                # curl failed.
                 return {"status": "ERROR", "message": f"Curl test failed: {str(e)}"}
         elif normalized_cmd == "OPNSENSE_GET_DHCP_LEASES":
+            # Live DHCP leases.
             return await self.engine.get_dhcp_leases()
 
         elif normalized_cmd == "OPNSENSE_GET_ARP_TABLE":
+            # Live reads, cached for next time.
             return self._cache_live(normalized_cmd, await self.engine.get_arp_table())
 
         elif normalized_cmd == "OPNSENSE_GET_ALL_RULES":
@@ -385,6 +464,7 @@ class OpnSpoke(BaseSpoke):
             return self._cache_live(normalized_cmd, await self.engine.get_all_aliases())
 
         elif normalized_cmd == "OPNSENSE_ADD_ALIAS":
+            # Writes: run, then drop the cached lists they change.
             return self._invalidate_on_write(await self.engine.add_alias(
                 data.get("name", ""),
                 data.get("type", "host"),
@@ -468,6 +548,7 @@ class OpnSpoke(BaseSpoke):
         # Network impairments (latency / loss per host or subnet, os-netimpair
         # plugin). Few objects and always read live, so not cached.
         elif normalized_cmd == "OPNSENSE_GET_IMPAIRMENTS":
+            # Impairments: list, add, edit, delete.
             return await impairments.list_impairments(self.engine)
 
         elif normalized_cmd == "OPNSENSE_ADD_IMPAIRMENT":
@@ -493,13 +574,16 @@ class OpnSpoke(BaseSpoke):
             # ``devices`` (hub-supplied, vault-resolved) = EVERY firewall bound
             # to this spoke (e.g. an HA pair). Each gets the cert + WebGUI
             # activation directly instead of relying on HA config sync.
+            # Firewalls listed by the hub.
             devices = [d for d in (data.get("devices") or []) if isinstance(d, dict) and d.get("host")]
+            # None listed: import on this spoke's own firewall.
             if not devices:
                 return await self.engine.import_cert(
                     data.get("domain", ""),
                     data.get("fullchain", ""),
                     data.get("privkey", ""),
                 )
+            # Import on each listed firewall.
             return await self._install_cert_on_devices(data, devices)
 
         elif normalized_cmd == "SEARCH_DHCP":
@@ -509,6 +593,7 @@ class OpnSpoke(BaseSpoke):
             # engine-side (see OpnsenseEngine.search_dhcp). We only forward
             # the contract fields — never filter spoke-side, never trust the
             # hub to have pre-filtered.
+            # Search term; scoping is done in the engine.
             q = data.get("q", "").strip()
             return await self.engine.search_dhcp(
                 q,
@@ -517,6 +602,7 @@ class OpnSpoke(BaseSpoke):
             )
 
         else:
+            # Known system command on a stale core: ack quietly.
             if command_type in _SYSTEM_COMMANDS:
                 # Stale /opt/lm/core: this system command should have been
                 # intercepted by handle_system_command but wasn't (core predates
@@ -527,6 +613,7 @@ class OpnSpoke(BaseSpoke):
                             "to clear.", command_type)
                 return {"status": "SUCCESS",
                         "message": f"{command_type} not applied — spoke core stale, update needed"}
+            # Unknown command.
             logger.warning(f"Unknown Opn command type: {command_type}")
             return {"status": "ERROR", "message": f"Command {command_type} not supported by opnsense module"}
 
@@ -536,12 +623,14 @@ class OpnSpoke(BaseSpoke):
         Serves the cached ``GET_SYSTEM_HEALTH`` entry when the refresh loop
         has primed it (avoids a fresh curl on every hub heartbeat/status poll)
         and falls back to a live fetch when the cache is cold or stale."""
+        # Cached health if primed, else a live fetch.
         cached = self._cache.get("GET_SYSTEM_HEALTH")
         if cached and cached.get("status") == "SUCCESS":
             health = cached
         else:
             health = self._cache_live(
                 "GET_SYSTEM_HEALTH", await self.engine.get_system_health())
+        # Status report.
         return {
             "spoke_id": self.spoke_id,
             "module": "opnsense-mgmt",
@@ -551,8 +640,10 @@ class OpnSpoke(BaseSpoke):
 
     def get_version(self) -> str:
         """Returns the current version of the OPNsense module (from the VERSION file)."""
+        # Read the VERSION file.
         from pathlib import Path
         try:
             return (Path(__file__).parent.parent / "VERSION").read_text().strip()
         except Exception:
+            # No VERSION file.
             return "unknown"
