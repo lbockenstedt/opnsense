@@ -1,3 +1,9 @@
+"""OPNsense API client used by the OPNsense spoke.
+
+Calls go through the system curl binary. It covers interfaces, firewall rules, NAT,
+aliases, DNS overrides, DHCP leases, the ARP table, system health and certificate import.
+"""
+# Standard library only.
 import logging
 import os
 import re
@@ -8,8 +14,10 @@ import base64
 import ssl
 from typing import Dict, Any, List, Optional, Tuple
 
+# Module logger.
 logger = logging.getLogger("OpnsenseEngine")
 
+# Marker curl writes before the HTTP status code at the end of the output.
 _HTTP_STATUS_MARK = "__LM_HTTP_STATUS__:"
 
 
@@ -24,9 +32,12 @@ class OpnsenseEngine:
     _CERT_IMPORT_TIMEOUT = 60
 
     def __init__(self, host: Optional[str], api_key: Optional[str], api_secret: Optional[str]):
+        """Store the connection settings and set up the alias category cache."""
+        # Connection settings.
         self.host = host
         self.api_key = api_key
         self.api_secret = api_secret
+        # Last time the unconfigured warning was logged.
         self._unconfigured_log_ts = 0.0
         # 5-min TTL memo for _alias_category_map: get_all_aliases + every
         # alias add/update/delete call it, and the category list changes
@@ -41,11 +52,13 @@ class OpnsenseEngine:
         """True only when a real firewall connection has been supplied: a host
         AND API credentials. There is no localhost default — an unconfigured
         engine never attempts a connection."""
+        # Host and both credentials are required.
         return bool(self.host and self.api_key and self.api_secret)
 
     def _log_unconfigured(self) -> None:
         """Throttled 'no firewall configured' notice (every 5 min) so an
         unconfigured spoke doesn't flood the log with per-endpoint errors."""
+        # Warn at most every 5 minutes.
         now = time.time()
         if now - self._unconfigured_log_ts >= 300:
             self._unconfigured_log_ts = now
@@ -55,13 +68,18 @@ class OpnsenseEngine:
 
     @staticmethod
     def _http_error_detail(text: str) -> str:
+        """Short error detail from an HTTP error body: its JSON message, else the text without tags."""
+        # json for parsing.
         import json
+        # JSON body: use its message.
         try:
             body = json.loads(text)
             if isinstance(body, dict):
                 return str(body.get("message") or body.get("errorMessage") or body)[:300]
         except Exception:  # noqa: BLE001
+            # Not JSON.
             pass
+        # Strip tags and whitespace, cap at 300 characters.
         return re.sub(r"<[^>]+>|\s+", " ", text).strip()[:300] or "no response body"
 
     async def _request(self, method: str, endpoint: str, data: Dict = None,
@@ -74,6 +92,7 @@ class OpnsenseEngine:
         the firewall can take longer to persist them — those callers pass a larger
         value so a slow-but-succeeding import isn't cut off at 15s (curl exit 28).
         """
+        # Local imports.
         import json
         import asyncio
         import subprocess
@@ -87,6 +106,7 @@ class OpnsenseEngine:
             return {"status": "ERROR", "message": "No firewall configured"}
 
         # Use the direct endpoint which now includes the /api prefix
+        # Full URL.
         url = f"https://{self.host}{endpoint}"
         logger.debug(f"Attempting API request to: {url}")
 
@@ -99,21 +119,28 @@ class OpnsenseEngine:
         # --connect-timeout bounds the TCP/TLS handshake separately from the
         # overall --max-time so an unreachable host fails fast without eating the
         # whole (possibly long) import budget.
+        # Build the curl command with time limits.
         connect_timeout = min(10, timeout)
         cmd = ["curl", "-sS", "--connect-timeout", str(connect_timeout),
                "--max-time", str(timeout)]
+        # Skip TLS checks unless opted in.
         verify_tls = os.getenv("LM_OPNSENSE_VERIFY_TLS", "0").strip().lower()
         if verify_tls not in {"1", "true", "yes", "on"}:
             cmd.append("-k")
+        # Path of the temporary credentials file.
         auth_cfg_path = None
+        # Errors return an ERROR result; the credentials file is always removed.
         try:
+            # Credentials, escaped for the curl config file.
             auth = f"{self.api_key}:{self.api_secret}"
             auth = auth.replace("\\", "\\\\").replace('"', '\\"')
+            # Write them to a private temporary file so they are not on the command line.
             with tempfile.NamedTemporaryFile("w", prefix="lm-opnsense-curl-",
                                              suffix=".conf", delete=False) as auth_cfg:
                 auth_cfg_path = auth_cfg.name
                 os.chmod(auth_cfg_path, 0o600)
                 auth_cfg.write(f'user = "{auth}"\n')
+            # Method, headers and the config file.
             cmd.extend([
                 "--config", auth_cfg_path,
                 "-X", method,
@@ -127,6 +154,7 @@ class OpnsenseEngine:
             # lacking a privilege) are reported as errors, not parsed as success.
             cmd.extend(["-w", "\n" + _HTTP_STATUS_MARK + "%{http_code}", url])
 
+            # Run curl.
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -134,6 +162,7 @@ class OpnsenseEngine:
             )
             stdout, stderr = await process.communicate()
 
+            # curl failed: report timeout or stderr.
             if process.returncode != 0:
                 # curl 28 = operation timed out. Make it explicit (and include the
                 # budget) because -s used to swallow it into a bare "code 28".
@@ -142,46 +171,63 @@ class OpnsenseEngine:
                                  or f"request timed out after {timeout}s (curl 28)")
                 else:
                     error_msg = stderr.decode().strip() or f"Curl failed with code {process.returncode}"
+                # Log and return the error.
                 logger.error(f"Curl request failed for {url}: {error_msg}")
                 return {"status": "ERROR", "message": error_msg}
 
+            # Split the output into body and HTTP status.
             out_text = stdout.decode()
             result_text, marked, code = out_text.rpartition(_HTTP_STATUS_MARK)
+            # No marker: no status.
             if not marked:
                 result_text, code = out_text, ""
+            # Trimmed body and numeric status.
             result_text = result_text.strip()
             http_status = int(code) if code.strip().isdigit() else 0
+            # HTTP error: report with detail.
             if http_status >= 400:
                 error_msg = f"HTTP {http_status}: {self._http_error_detail(result_text)}"
+                # Hint for auth errors.
                 if http_status in (401, 403):
                     error_msg += (" (check the API key/secret and that its user has the "
                                   "privilege for this page)")
+                # Log and return the error.
                 logger.error(f"API request failed for {method} {endpoint}: {error_msg}")
                 return {"status": "ERROR", "message": error_msg, "http_status": http_status}
+            # Empty body.
             if not result_text:
                 return {"status": "ERROR", "message": "Empty response from server"}
+            # Raw mode: return the text.
             if raw:
                 return {"raw": result_text}
 
+            # Parse JSON and return it.
             result = json.loads(result_text)
             logger.debug(f"API request to {url} succeeded. Response keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
             return result
 
         except Exception as e:
+            # Log and return the error.
             logger.exception(f"Exception during API request to {url}")
             return {"status": "ERROR", "message": str(e)}
         finally:
+            # Remove the credentials file.
             if auth_cfg_path:
+                # Ignore removal errors.
                 try:
                     os.unlink(auth_cfg_path)
                 except OSError:
+                    # Already gone.
                     pass
 
     async def get_interface_status(self) -> Dict[str, Any]:
         """Fetches current status of network interfaces."""
+        # Fetch interface info.
         res = await self._request("GET", "/api/interfaces/overview/interfaces_info")
 
+        # Expect a dict.
         if isinstance(res, dict):
+            # API error.
             if res.get("status") == "ERROR" or "error" in res:
                 return {"status": "ERROR", "details": res}
 
@@ -193,7 +239,9 @@ class OpnsenseEngine:
             data_payload = res.get("data") or res.get("rows") or res
 
             if isinstance(data_payload, dict):
+                # Dict: one row per interface.
                 for iface_name, info in data_payload.items():
+                    # Normalise the fields.
                     if isinstance(info, dict):
                         # Normalize interface data for UI consistency
                         processed_iface = {
@@ -207,38 +255,51 @@ class OpnsenseEngine:
                             "flags": ",".join(info.get("flags") if isinstance(info.get("flags"), list) else []),
                             "capabilities": ",".join(info.get("capabilities") if isinstance(info.get("capabilities"), list) else [])
                         }
+                        # Keep it.
                         interfaces.append(processed_iface)
                     else:
+                        # Not a dict: minimal row.
                         interfaces.append({"name": iface_name, "status": info, "ip": "N/A"})
             elif isinstance(data_payload, list):
                 # If it's already a list, we still want to normalize a few keys
+                # Normalise each row in place.
                 for iface in data_payload:
+                    # Only dicts.
                     if isinstance(iface, dict):
+                        # ip from addr4; flags and capabilities as strings.
                         if "addr4" in iface and "ip" not in iface:
                             iface["ip"] = iface["addr4"]
                         if "flags" in iface and isinstance(iface["flags"], list):
                             iface["flags"] = ",".join(iface["flags"])
                         if "capabilities" in iface and isinstance(iface["capabilities"], list):
                             iface["capabilities"] = ",".join(iface["capabilities"])
+                # Use the list as-is.
                 interfaces = data_payload
 
+            # Success.
             return {"status": "SUCCESS", "data": interfaces}
 
+        # Not a dict.
         return {"status": "ERROR", "message": "Unexpected API response format"}
 
     async def add_firewall_rule(self, rule_config: Dict[str, Any]) -> Dict[str, Any]:
         """Adds a new firewall rule to the specified interface."""
+        # Post the rule.
         res = await self._request("POST", "/api/firewall/filter/add_rule", data=rule_config)
+        # API error.
         if isinstance(res, dict) and (res.get("status") == "ERROR" or "error" in res):
             return {"status": "ERROR", "details": res}
+        # Success with the new id.
         return {"status": "SUCCESS", "rule_id": res.get("id"), "message": "Rule added successfully"}
 
     async def delete_firewall_rule(self, rule_id: str) -> Dict[str, Any]:
         """Deletes a specific firewall rule."""
         # OPNsense uses POST for deletion with the UUID in the data payload
         res = await self._request("POST", "/api/firewall/filter/del_rule", data={"uuid": rule_id})
+        # API error.
         if isinstance(res, dict) and (res.get("status") == "ERROR" or "error" in res):
             return {"status": "ERROR", "details": res}
+        # Success.
         return {"status": "SUCCESS", "message": f"Rule {rule_id} deleted"}
 
     async def manage_alias(self, alias_name: str, hosts: List[str], action: str = "update") -> Dict[str, Any]:
@@ -248,19 +309,26 @@ class OpnsenseEngine:
         endpoint = "/api/firewall/alias/set" if action == "update" else "/api/firewall/alias/del_item"
         method = "POST"
 
+        # Delete takes only the alias name.
         if action != "update":
             data = {"alias": alias_name} # Simplification for deletion
 
+        # Send it.
         res = await self._request(method, endpoint, data=data)
+        # API error.
         if isinstance(res, dict) and (res.get("status") == "ERROR" or "error" in res):
             return {"status": "ERROR", "details": res}
+        # Success.
         return {"status": "SUCCESS", "message": f"Alias {alias_name} {action}d successfully"}
 
     async def get_system_health(self) -> Dict[str, Any]:
         """Fetches basic system health (CPU/Memory)."""
+        # Fetch system health.
         res = await self._request("GET", "/api/diagnostics/systemhealth/get_system_health")
+        # API error.
         if isinstance(res, dict) and (res.get("status") == "ERROR" or "error" in res):
             return {"status": "ERROR", "details": res}
+        # Success.
         return {"status": "SUCCESS", "data": res}
 
     async def get_overview(self) -> Dict[str, Any]:
@@ -272,15 +340,21 @@ class OpnsenseEngine:
         counter delta between two traffic samples taken around the other calls
         (the activity call runs ``top`` for ~2s, so the window is real)."""
         def ok(res):
+            """True if the result is a dict and not an ERROR."""
             return isinstance(res, dict) and res.get("status") != "ERROR"
 
         def num(value):
+            """``value`` as a float, or None if it is not numeric."""
+            # Convert.
             try:
                 return float(value)
             except (TypeError, ValueError):
+                # Not a number.
                 return None
 
+        # First traffic sample.
         traffic_before = await self._request("GET", "/api/diagnostics/traffic/interface")
+        # The other sections in parallel.
         info, uptime, resources, activity, gateways = await asyncio.gather(
             self._request("GET", "/api/diagnostics/system/system_information"),
             self._request("GET", "/api/diagnostics/system/system_time"),
@@ -288,32 +362,41 @@ class OpnsenseEngine:
             self._request("GET", "/api/diagnostics/activity/get_activity"),
             self._request("GET", "/api/routes/gateway/status"),
         )
+        # Second traffic sample.
         traffic_after = await self._request("GET", "/api/diagnostics/traffic/interface")
 
+        # Everything failed: error.
         if not any(ok(r) for r in (info, uptime, resources, activity, gateways, traffic_after)):
             return {"status": "ERROR", "message": info.get("message", "Firewall unreachable")}
 
+        # Empty overview.
         overview = {"hostname": "", "version": "", "uptime": "", "loadavg": "",
                     "cpu_percent": None, "memory": {}, "gateways": [], "interfaces": []}
+        # Host name and version.
         if ok(info):
             overview["hostname"] = info.get("name", "")
             overview["version"] = (info.get("versions") or [""])[0]
+        # Uptime and load.
         if ok(uptime):
             overview["uptime"] = uptime.get("uptime", "")
             overview["loadavg"] = uptime.get("loadavg", "")
         if ok(activity):
             # top header: "CPU:  2.1% user, 0.0% nice, 1.3% system, 0.2% interrupt, 96.4% idle"
+            # CPU busy percent from the idle figure.
             for line in activity.get("headers") or []:
                 idle = re.search(r"CPU:.*?([\d.]+)% idle", line)
                 if idle:
                     overview["cpu_percent"] = round(100 - float(idle.group(1)), 1)
+        # Memory use.
         memory = resources.get("memory") if ok(resources) else None
         if isinstance(memory, dict):
+            # Used, total and percent.
             used, total = num(memory.get("used")), num(memory.get("total"))
             if used is not None and total:
                 overview["memory"] = {"used": used, "total": total,
                                       "percent": round(used * 100 / total, 1)}
         if ok(gateways):
+            # One row per gateway.
             for gw in gateways.get("items") or []:
                 overview["gateways"].append({
                     "name": gw.get("name", ""),
@@ -324,21 +407,28 @@ class OpnsenseEngine:
                     "loss": gw.get("loss", ""),
                 })
         if ok(traffic_before) and ok(traffic_after):
+            # Seconds between the samples, and the first sample's counters.
             seconds = (num(traffic_after.get("time")) or 0) - (num(traffic_before.get("time")) or 0)
             before = traffic_before.get("interfaces") or {}
+            # Per-interface rates in bits per second.
             for key, now in (traffic_after.get("interfaces") or {}).items():
+                # Skip interfaces missing from either sample.
                 prev = before.get(key)
                 if not isinstance(now, dict) or not isinstance(prev, dict) or seconds <= 0:
                     continue
+                # In and out rates.
                 rates = {}
                 for field, label in (("bytes received", "in_bps"), ("bytes transmitted", "out_bps")):
                     delta = (num(now.get(field)) or 0) - (num(prev.get(field)) or 0)
                     rates[label] = max(0, round(delta * 8 / seconds))
+                # Add the row.
                 overview["interfaces"].append({"name": now.get("name") or key, **rates})
+        # Success.
         return {"status": "SUCCESS", "data": overview}
 
     async def get_all_firewall_rules(self) -> Dict[str, Any]:
         """Fetches all firewall rules across all interfaces."""
+        # Search all rules.
         res = await self._request("POST", "/api/firewall/filter/search_rule", data={})
 
         # Handle API errors returned as JSON
@@ -349,6 +439,7 @@ class OpnsenseEngine:
             # Extract rules list from response
             rules_data = res.get("rules") or res.get("data") or res.get("rows")
 
+            # No rules.
             if rules_data is None or (isinstance(rules_data, list) and len(rules_data) == 0):
                 logger.info(f"API returned success but no rules found. Response: {res}")
                 return {"status": "SUCCESS", "data": [], "source": "empty"}
@@ -357,20 +448,26 @@ class OpnsenseEngine:
             if isinstance(rules_data, dict):
                 # Convert dict values to a list and inject the key (uuid) as the 'id'
                 processed_rules = []
+                # Add the uuid as the id.
                 for uuid, rule in rules_data.items():
                     if isinstance(rule, dict):
                         rule['id'] = uuid
                         processed_rules.append(rule)
                     else:
+                        # Not a dict: keep it raw.
                         processed_rules.append({"id": uuid, "raw": rule})
+                # The list.
                 rules = processed_rules
             elif isinstance(rules_data, list):
+                # Already a list.
                 rules = rules_data
             else:
+                # Unexpected shape.
                 rules = []
 
             # Map OPNsense fields to WebUI expected fields: id, action, protocol, source, destination, description
             final_rules = []
+            # Map each rule.
             for r in rules:
                 if isinstance(r, dict):
                     # Combine destination network and port for the UI display
@@ -390,6 +487,7 @@ class OpnsenseEngine:
                         "description": r.get("description") or r.get("descr", "No description")
                     })
                 else:
+                    # Not a dict: keep it raw.
                     final_rules.append({"id": "unknown", "raw": str(r)})
 
             # Safety limit to prevent massive payloads causing LLM 400 errors (Payload Too Large)
@@ -397,21 +495,28 @@ class OpnsenseEngine:
                 logger.warning(f"Truncating firewall rules from {len(final_rules)} to 200 for stability")
                 final_rules = final_rules[:200]
 
+            # Success.
             return {"status": "SUCCESS", "data": final_rules}
 
+        # Not a dict.
         return {"status": "ERROR", "message": "Unexpected API response format"}
 
     async def get_firewall_stats(self) -> Dict[str, Any]:
         """Fetches general firewall statistics (packet counts, etc)."""
+        # Fetch stats.
         res = await self._request("GET", "/api/diagnostics/firewall/stats")
+        # API error.
         if isinstance(res, dict) and (res.get("status") == "ERROR" or "error" in res):
             return {"status": "ERROR", "details": res}
+        # Success.
         return {"status": "SUCCESS", "data": res}
 
     async def get_dns_records(self) -> Dict[str, Any]:
         """Fetches Unbound DNS host overrides."""
+        # Fetch host overrides.
         res = await self._request("GET", "/api/unbound/settings/searchHostOverride")
 
+        # Expect a dict.
         if isinstance(res, dict):
             # Classify a _request ERROR envelope BEFORE the rows-is-None handling
             # below — otherwise a 401/timeout (no "rows") looks like "no data" and
@@ -420,13 +525,16 @@ class OpnsenseEngine:
                 return {"status": "ERROR", "details": res}
             # The response contains a 'rows' list of overrides
             rows = res.get("rows")
+            # No rows.
             if rows is None:
                 logger.info(f"DNS API returned success but no records found. Response: {res}")
                 return {"status": "SUCCESS", "data": [], "source": "empty"}
 
+            # Guard against a non-list.
             if not isinstance(rows, list):
                 rows = []
 
+            # Map each override.
             processed_dns = []
             for record in rows:
                 if isinstance(record, dict):
@@ -445,8 +553,10 @@ class OpnsenseEngine:
                         "description": record.get("description", ""),
                     })
 
+            # Success.
             return {"status": "SUCCESS", "data": processed_dns}
 
+        # Not a dict.
         return {"status": "ERROR", "message": "Unexpected API response format"}
 
     @staticmethod
@@ -459,15 +569,20 @@ class OpnsenseEngine:
         non-``any`` value found, else ``"any"`` so the LM subnet filter can treat
         an unspecified source as a wildcard (skipped, not matched).
         """
+        # Try each key in order.
         for key in ("source", "%source.network", "source.network", "source.address", "source_net"):
+            # Skip missing keys.
             v = rule.get(key)
             if v is None:
                 continue
+            # Dict: take the address or network.
             if isinstance(v, dict):
                 v = v.get("address") or v.get("network") or v.get("any") or ""
+            # First non-empty, non-any value wins.
             s = str(v or "").strip()
             if s and s.lower() != "any":
                 return s
+        # Default.
         return "any"
 
     async def get_nat_policies(self) -> Dict[str, Any]:
@@ -489,6 +604,7 @@ class OpnsenseEngine:
             ("/api/firewall/one_to_one/search_rule", "1:1 NAT", "GET"),
         ]
 
+        # Collected rows, warnings and counters.
         all_processed_nat: list = []
         warnings: list = []
         errored = 0
@@ -499,21 +615,28 @@ class OpnsenseEngine:
         # 3 sequential curl round-trips (each a fresh TCP+TLS+Basic auth).
         # _request is async (curl subprocess), so asyncio.gather overlaps them.
         async def _probe(endpoint, label, method):
+            """Run one NAT search request: POST with an empty body, or GET with show_all."""
+            # URL and body for the method.
             request_url = f"{endpoint}?show_all=1" if method == "GET" else endpoint
             data = {} if method == "POST" else None
+            # Send it.
             return await self._request(method, request_url, data=data)
 
+        # Probe all endpoints in parallel.
         probe_results = await asyncio.gather(
             *[_probe(ep, lbl, m) for ep, lbl, m in endpoints]
         )
 
+        # Handle each result.
         for (endpoint, label, method), res in zip(endpoints, probe_results):
+            # Log the probe.
             logger.debug(f"Probing NAT endpoint: {endpoint} ({label}) via {method}")
 
             # Classify the response. An ERROR envelope from _request (curl fail,
             # 404, permission denied, etc.) must not be confused with a valid
             # empty result — that conflation was the silent-empty root cause.
             if not isinstance(res, dict) or res.get("status") == "ERROR" or "error" in res or "errorMessage" in res:
+                # Count the error and keep it.
                 errored += 1
                 msg = (res.get("message") if isinstance(res, dict) else None) or str(res)
                 last_error = f"{label}: {msg}"
@@ -521,12 +644,14 @@ class OpnsenseEngine:
                 logger.warning("[sync-error] %s: NAT probe %s failed: %s", label, endpoint, msg)
                 continue
 
+            # Valid response: count it and get the rows.
             ok_endpoints += 1
             rows = res.get("rows") or res.get("data") or res.get("rules")
             # OPNsense sometimes returns rules keyed by uuid (a dict, not a list).
             if isinstance(rows, dict):
                 rows = [dict({"uuid": uid}, **(v if isinstance(v, dict) else {"raw": v})) for uid, v in rows.items()]
 
+            # Map each rule.
             if rows and isinstance(rows, list):
                 logger.debug(f"Found {len(rows)} rules in {label} endpoint.")
                 for rule in rows:
@@ -547,6 +672,7 @@ class OpnsenseEngine:
                         if not rule.get("dest_address") and not rule.get("internal_ip"):
                             logger.debug(f"NAT rule {rule.get('uuid')} missing IP fields. Keys: {list(rule.keys())}")
             else:
+                # Valid but empty.
                 logger.debug(f"No rules found in {label} endpoint (valid empty response).")
 
         # Every probe failed — almost certainly OPNsense < 26.1 (no MVC NAT API)
@@ -570,6 +696,7 @@ class OpnsenseEngine:
             logger.warning(f"Truncating NAT rules from {len(all_processed_nat)} to 200 for stability")
             all_processed_nat = all_processed_nat[:200]
 
+        # Success, with warnings and a source label.
         out: Dict[str, Any] = {"status": "SUCCESS", "data": all_processed_nat}
         if warnings:
             out["warnings"] = warnings
@@ -580,7 +707,9 @@ class OpnsenseEngine:
 
     async def apply_firewall_changes(self) -> Dict[str, Any]:
         """Applies pending firewall rule changes."""
+        # Apply pending changes.
         res = await self._request("POST", "/api/firewall/filter/apply", data={})
+        # Success unless the call failed.
         return {"status": "SUCCESS", "message": "Firewall changes applied"} if not (isinstance(res, dict) and res.get("status") == "ERROR") else res
 
     async def _alias_category_map(self, invalidate: bool = False) -> Dict[str, str]:
@@ -598,22 +727,28 @@ class OpnsenseEngine:
         alias write call this, and the category list changes rarely. Pass
         ``invalidate=True`` after an alias add/update that could create a new
         category to force a fresh fetch on the next call."""
+        # Serve the cached map while fresh.
         now = time.time()
         if (not invalidate and self._alias_cat_map is not None
                 and (now - self._alias_cat_map_ts) < self._alias_cat_map_ttl):
             return self._alias_cat_map
+        # Fetch categories; on failure fall back to the cached map.
         try:
             res = await self._request("GET", "/api/firewall/alias/listCategories")
         except Exception as e:  # noqa: BLE001
+            # Fetch failed.
             logger.warning("alias category list fetch failed: %s", e)
             return self._alias_cat_map or {}
+        # Not a dict.
         if not isinstance(res, dict):
             return self._alias_cat_map or {}
+        # Map uuid to name.
         rows = res.get("rows") or res.get("data") or []
         out: Dict[str, str] = {}
         for row in (rows if isinstance(rows, list) else []):
             if isinstance(row, dict) and row.get("uuid") and row.get("name"):
                 out[str(row["uuid"])] = str(row["name"])
+        # Cache it.
         self._alias_cat_map = out
         self._alias_cat_map_ts = now
         return out
@@ -624,16 +759,19 @@ class OpnsenseEngine:
         """Comma-separated category *names* for one alias row, resolved from the
         UUID list OPNsense returns — ``categories_uuid`` array preferred, else the
         ``categories`` comma-separated UUID string. Empty when none/unknown."""
+        # Prefer the categories_uuid list.
         uuids: List[str] = []
         cu = row.get("categories_uuid")
         if isinstance(cu, list):
             uuids = [str(u) for u in cu if u]
         else:
+            # Else the categories string or list.
             cats = row.get("categories")
             if isinstance(cats, str) and cats.strip():
                 uuids = [u.strip() for u in cats.split(",") if u.strip()]
             elif isinstance(cats, list):
                 uuids = [str(u) for u in cats if u]
+        # Names for known uuids.
         return ", ".join(cat_map[u] for u in uuids if u and cat_map.get(u))
 
     async def _alias_category_uuids_for(self, category: str) -> str:
@@ -644,6 +782,7 @@ class OpnsenseEngine:
         — OPNsense categories are first-class objects referenced by UUID, so a
         name that isn't pre-created cannot be assigned. Empty input → empty
         (clears the alias's categories on edit)."""
+        # Empty input.
         if not category or not str(category).strip():
             return ""
         # Bypass the 5-min memo here (invalidate=True): this runs on the alias
@@ -653,25 +792,33 @@ class OpnsenseEngine:
         # resolve and be silently DROPPED (see the warn below). Fetching live
         # ensures a just-created category resolves and refreshes the memo.
         cat_map = await self._alias_category_map(invalidate=True)
+        # Reverse map: name to uuid.
         name_to_uuid = {name: uuid for uuid, name in cat_map.items()}
+        # Look up each name; drop unknown ones.
         uuids: List[str] = []
         for name in [n.strip() for n in str(category).split(",") if n.strip()]:
+            # Known: keep the uuid.
             uid = name_to_uuid.get(name)
             if uid:
                 uuids.append(uid)
             else:
+                # Unknown: warn.
                 logger.warning(
                     "alias category '%s' is not a known OPNsense category — dropping",
                     name)
+        # Comma-separated uuids.
         return ",".join(uuids)
 
     async def get_all_aliases(self) -> Dict[str, Any]:
         """Fetches all firewall aliases. The Category column is resolved from each
         alias's ``categories`` UUID list via ``listCategories`` — OPNsense tags
         aliases by category UUID, not by a name field."""
+        # Category names, then the alias list.
         cat_map = await self._alias_category_map()
         res = await self._request("GET", "/api/firewall/alias/searchItem")
+        # Expect a dict.
         if isinstance(res, dict):
+            # Map each alias.
             rows = res.get("rows") or res.get("data") or []
             processed = []
             for row in (rows if isinstance(rows, list) else []):
@@ -684,7 +831,9 @@ class OpnsenseEngine:
                         "category": self._resolve_alias_category_uuids(row, cat_map),
                         "description": row.get("description", ""),
                     })
+            # Success.
             return {"status": "SUCCESS", "data": processed}
+        # Not a dict.
         return {"status": "ERROR", "message": "Unexpected API response format"}
 
     async def add_alias(self, name: str, type_: str, content: str, description: str = "", category: str = "") -> Dict[str, Any]:
@@ -693,24 +842,32 @@ class OpnsenseEngine:
         and sent under ``categories`` — the OPNsense alias model field. Names that
         aren't existing OPNsense categories are dropped (see
         ``_alias_category_uuids_for``)."""
+        # Category uuids and the alias payload.
         cats = await self._alias_category_uuids_for(category)
         data = {"alias": {"name": name, "type": type_, "content": content, "description": description, "categories": cats, "enabled": "1"}}
+        # Add it.
         res = await self._request("POST", "/api/firewall/alias/addItem", data=data)
+        # API error.
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
+        # Apply.
         await self._request("POST", "/api/firewall/alias/reconfigure", data={})
         return {"status": "SUCCESS", "message": f"Alias '{name}' added"}
 
     async def delete_alias(self, uuid: str) -> Dict[str, Any]:
         """Deletes a firewall alias by UUID."""
+        # Delete it.
         res = await self._request("POST", f"/api/firewall/alias/delItem/{uuid}", data={})
+        # API error.
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
+        # Apply.
         await self._request("POST", "/api/firewall/alias/reconfigure", data={})
         return {"status": "SUCCESS", "message": f"Alias {uuid} deleted"}
 
     async def add_firewall_rule_and_apply(self, rule_config: Dict[str, Any]) -> Dict[str, Any]:
         """Adds a firewall rule and applies it."""
+        # Add, then apply on success.
         res = await self.add_firewall_rule(rule_config)
         if res.get("status") == "SUCCESS":
             await self.apply_firewall_changes()
@@ -718,6 +875,7 @@ class OpnsenseEngine:
 
     async def delete_firewall_rule_and_apply(self, rule_id: str) -> Dict[str, Any]:
         """Deletes a firewall rule and applies changes."""
+        # Delete, then apply on success.
         res = await self.delete_firewall_rule(rule_id)
         if res.get("status") == "SUCCESS":
             await self.apply_firewall_changes()
@@ -726,56 +884,76 @@ class OpnsenseEngine:
     async def add_nat_rule(self, nat_type: str, rule: Dict[str, Any]) -> Dict[str, Any]:
         """Adds a NAT rule. nat_type: 'd_nat' | 'source_nat' | 'one_to_one'
         ('nat_1to1' accepted as a legacy alias for 'one_to_one')."""
+        # Add endpoint per NAT type.
         endpoint_map = {
             "d_nat": "/api/firewall/d_nat/addRule",
             "source_nat": "/api/firewall/source_nat/addRule",
             "one_to_one": "/api/firewall/one_to_one/addRule",
             "nat_1to1": "/api/firewall/one_to_one/addRule",
         }
+        # Endpoint, defaulting to d_nat.
         endpoint = endpoint_map.get(nat_type, endpoint_map["d_nat"])
+        # Add the rule.
         res = await self._request("POST", endpoint, data={"rule": rule})
+        # API error.
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
+        # Apply.
         await self._request("POST", "/api/firewall/filter/apply", data={})
         return {"status": "SUCCESS", "message": f"NAT rule added ({nat_type})"}
 
     async def delete_nat_rule(self, nat_type: str, uuid: str) -> Dict[str, Any]:
         """Deletes a NAT rule by UUID."""
+        # Delete endpoint per NAT type.
         endpoint_map = {
             "d_nat": f"/api/firewall/d_nat/delRule/{uuid}",
             "source_nat": f"/api/firewall/source_nat/delRule/{uuid}",
             "one_to_one": f"/api/firewall/one_to_one/delRule/{uuid}",
             "nat_1to1": f"/api/firewall/one_to_one/delRule/{uuid}",
         }
+        # Endpoint, defaulting to d_nat.
         endpoint = endpoint_map.get(nat_type, endpoint_map["d_nat"])
+        # Delete the rule.
         res = await self._request("POST", endpoint, data={})
+        # API error.
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
+        # Apply.
         await self._request("POST", "/api/firewall/filter/apply", data={})
         return {"status": "SUCCESS", "message": f"NAT rule {uuid} deleted"}
 
     async def add_dns_record(self, hostname: str, domain: str, ip: str, description: str = "") -> Dict[str, Any]:
         """Adds a DNS host override in Unbound."""
+        # Override payload.
         data = {"host": {"hostname": hostname, "domain": domain, "server": ip, "description": description, "enabled": "1"}}
+        # Add it.
         res = await self._request("POST", "/api/unbound/settings/addHostOverride", data=data)
+        # API error.
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
+        # Reload Unbound.
         await self._request("POST", "/api/unbound/service/reconfigure", data={})
         return {"status": "SUCCESS", "message": f"DNS record {hostname}.{domain} → {ip} added"}
 
     async def delete_dns_record(self, uuid: str) -> Dict[str, Any]:
         """Deletes a DNS host override by UUID."""
+        # Delete it.
         res = await self._request("POST", f"/api/unbound/settings/delHostOverride/{uuid}", data={})
+        # API error.
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
+        # Reload Unbound.
         await self._request("POST", "/api/unbound/service/reconfigure", data={})
         return {"status": "SUCCESS", "message": f"DNS record {uuid} deleted"}
 
     async def edit_firewall_rule(self, uuid: str, rule_config: Dict[str, Any]) -> Dict[str, Any]:
         """Updates an existing firewall rule by UUID."""
+        # Update the rule.
         res = await self._request("POST", f"/api/firewall/filter/setRule/{uuid}", data={"rule": rule_config})
+        # API error.
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
+        # Apply.
         await self.apply_firewall_changes()
         return {"status": "SUCCESS", "message": f"Rule {uuid} updated"}
 
@@ -783,35 +961,48 @@ class OpnsenseEngine:
         """Updates an existing alias by UUID. ``category`` is a comma-separated
         category *name* string resolved to UUIDs and sent under ``categories``
         (the OPNsense alias model field); empty clears the alias's categories."""
+        # Category uuids and the alias payload.
         cats = await self._alias_category_uuids_for(category)
         data = {"alias": {"name": name, "type": type_, "content": content, "description": description, "categories": cats, "enabled": "1"}}
+        # Update it.
         res = await self._request("POST", f"/api/firewall/alias/setItem/{uuid}", data=data)
+        # API error.
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
+        # Apply.
         await self._request("POST", "/api/firewall/alias/reconfigure", data={})
         return {"status": "SUCCESS", "message": f"Alias '{name}' updated"}
 
     async def edit_nat_rule(self, nat_type: str, uuid: str, rule: Dict[str, Any]) -> Dict[str, Any]:
         """Updates an existing NAT rule by UUID."""
+        # Update endpoint per NAT type.
         endpoint_map = {
             "d_nat": f"/api/firewall/d_nat/setRule/{uuid}",
             "source_nat": f"/api/firewall/source_nat/setRule/{uuid}",
             "one_to_one": f"/api/firewall/one_to_one/setRule/{uuid}",
             "nat_1to1": f"/api/firewall/one_to_one/setRule/{uuid}",
         }
+        # Endpoint, defaulting to d_nat.
         endpoint = endpoint_map.get(nat_type, endpoint_map["d_nat"])
+        # Update the rule.
         res = await self._request("POST", endpoint, data={"rule": rule})
+        # API error.
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
+        # Apply.
         await self._request("POST", "/api/firewall/filter/apply", data={})
         return {"status": "SUCCESS", "message": f"NAT rule updated ({nat_type})"}
 
     async def edit_dns_record(self, uuid: str, hostname: str, domain: str, ip: str, description: str = "") -> Dict[str, Any]:
         """Updates an existing DNS host override by UUID."""
+        # Override payload.
         data = {"host": {"hostname": hostname, "domain": domain, "server": ip, "description": description, "enabled": "1"}}
+        # Update it.
         res = await self._request("POST", f"/api/unbound/settings/setHostOverride/{uuid}", data=data)
+        # API error.
         if isinstance(res, dict) and res.get("status") == "ERROR":
             return res
+        # Reload Unbound.
         await self._request("POST", "/api/unbound/service/reconfigure", data={})
         return {"status": "SUCCESS", "message": f"DNS record {uuid} updated"}
 
@@ -836,6 +1027,7 @@ class OpnsenseEngine:
         imported cert to the WebUI/HAProxy listener is a follow-up (the first
         assignment is UI-only in OPNsense, then ``/set/<uuid>`` renews in place).
         """
+        # Split the chain into leaf and CAs; both leaf and key are required.
         leaf, ca_blocks = self._split_chain(fullchain)
         if not leaf or not privkey:
             return {"status": "ERROR",
@@ -844,11 +1036,13 @@ class OpnsenseEngine:
         # Best-effort: a benign duplicate-root error must not block the leaf.
         base = domain or "lm-managed"
         ca_imports: List[Dict[str, Any]] = []
+        # Import each CA and record the result.
         for idx, ca_pem in enumerate(ca_blocks, 1):
             ca_descr = f"lm-le-{base}-ca" if len(ca_blocks) == 1 else f"lm-le-{base}-ca{idx}"
             r = await self.import_ca(ca_descr, ca_pem)
             ca_imports.append({"descr": ca_descr, "status": r.get("status"),
                                "message": r.get("message")})
+        # Leaf certificate payload.
         cert_payload = {
             "action": "import", "descr": domain or "lm-managed",
             "cert_type": "usr_cert", "private_key_location": "firewall",
@@ -861,26 +1055,32 @@ class OpnsenseEngine:
         # HTTPS cert; replace it when it is the factory self-signed cert or an
         # earlier cert for this domain (never someone else's CA-signed cert).
         activate = os.getenv("LM_OPNSENSE_ACTIVATE_WEBGUI", "1").strip().lower() not in {"0", "false", "no", "off"}
+        # Find the WebGUI's current cert.
         webgui = await self._webgui_cert_row() if activate else None
         webgui_uuid = None
         if webgui:
+            # Replace it only if self-signed or already for this domain.
             row, self_signed = webgui
             if self_signed or row.get("descr") == domain or row.get("commonname") == domain:
                 webgui_uuid = row.get("uuid")
             else:
                 logger.info("[cert] WebGUI serves '%s' (%s) — not an LM/self-signed cert, leaving it",
                             row.get("descr"), row.get("commonname"))
+        # Target: the WebGUI cert, else an existing cert with this name.
         existing_uuid = webgui_uuid or await self._find_cert_uuid(domain or "")
+        # Update in place.
         if existing_uuid:
             res = await self._request("POST", f"/api/trust/cert/set/{existing_uuid}",
                                       data={"cert": cert_payload},
                                       timeout=self._CERT_IMPORT_TIMEOUT)
             action = "updated"
         else:
+            # Otherwise add a new one.
             res = await self._request("POST", "/api/trust/cert/add",
                                       data={"cert": cert_payload},
                                       timeout=self._CERT_IMPORT_TIMEOUT)
             action = "added"
+        # Write failed?
         failure = self._write_failure(res)
         if failure:
             # Surface the CA import results alongside so a "missing CA key" leaf
@@ -889,57 +1089,81 @@ class OpnsenseEngine:
                            domain, action, failure, ca_imports)
             return {"status": "ERROR", "message": f"cert import failed: {failure}",
                     "ca_imports": ca_imports}
+        # Log success.
         logger.info("[cert] '%s' %s in OPNsense Trust (uuid=%s); CA imports: %s",
                     domain, action, existing_uuid or (res or {}).get("uuid"), ca_imports)
+        # Base message.
         message = f"cert '{domain}' {action}"
         if webgui_uuid:
+            # WebGUI cert replaced: drop duplicates, restart and verify.
             await self._remove_stale_duplicates(domain, keep_uuid=webgui_uuid)
             active = await self._restart_webgui_and_verify(leaf)
             message += ("; activated on the WebGUI" if active
                         else "; WebGUI restarted but still serving the previous cert")
         elif activate and not webgui:
+            # WebGUI cert not found.
             message += "; WebGUI cert could not be identified — not activated"
         elif activate:
+            # WebGUI uses someone else's cert.
             message += "; WebGUI uses another cert — not activated"
+        # Success.
         return {"status": "SUCCESS", "message": message, "ca_imports": ca_imports}
 
     @staticmethod
     def _pem_to_der(pem: str) -> Optional[bytes]:
+        """DER bytes of the first certificate in a PEM string, or None."""
+        # First PEM certificate block.
         m = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem or "", re.DOTALL)
         if not m:
             return None
+        # Convert to DER.
         try:
             return ssl.PEM_cert_to_DER_cert(m.group(0))
         except Exception:  # noqa: BLE001
+            # Not a valid certificate.
             return None
 
     async def _served_cert_der(self) -> Optional[bytes]:
         """DER of the cert the WebGUI presents right now (no verification)."""
+        # No host.
         if not self.host:
             return None
+        # Host and port.
         host, _, port = self.host.partition(":")
+        # Fetch the served cert in a thread, with a timeout.
         try:
             pem = await asyncio.wait_for(asyncio.to_thread(
                 ssl.get_server_certificate, (host, int(port or 443))), timeout=15)
         except Exception as e:  # noqa: BLE001
+            # Fetch failed.
             logger.info("[cert] could not read the WebGUI cert from %s: %s", self.host, e)
             return None
+        # As DER.
         return self._pem_to_der(pem)
 
     async def _trust_cert_rows(self) -> List[Dict[str, Any]]:
+        """All rows of the OPNsense Trust certificate list."""
+        # Search all certs.
         res = await self._request("POST", "/api/trust/cert/search",
                                   data={"current": 1, "rowCount": -1, "searchPhrase": ""})
+        # Not a dict.
         if not isinstance(res, dict):
             return []
+        # Dict rows only.
         return [r for r in (res.get("rows") or []) if isinstance(r, dict)]
 
     @staticmethod
     def _row_der(row: Dict[str, Any]) -> Optional[bytes]:
+        """DER bytes of a Trust row's certificate, or None."""
+        # Base64 PEM from the row.
         crt = row.get("crt") or ""
+        # Decode it.
         try:
             pem = base64.b64decode(crt).decode("utf-8", "replace") if crt else ""
         except Exception:  # noqa: BLE001
+            # Bad base64.
             return None
+        # As DER.
         return OpnsenseEngine._pem_to_der(pem)
 
     async def _webgui_certref(self) -> Optional[str]:
@@ -947,18 +1171,23 @@ class OpnsenseEngine:
         authoritative WebGUI cert assignment (no dedicated API exists). Returns
         ``None`` if the config can't be read, ``""`` if nothing is assigned.
         The config holds secrets: only this one element is parsed, nothing logged."""
+        # Download the config backup as text.
         res = await self._request("GET", "/api/core/backup/download/this", raw=True)
         text = (res or {}).get("raw") if isinstance(res, dict) else None
+        # Unreadable.
         if not text:
             logger.info("[cert] could not read config from %s to find the WebGUI cert: %s",
                         self.host, (res or {}).get("message") if isinstance(res, dict) else res)
             return None
+        # Keep a non-secret excerpt for diagnostics.
         self._config_diag = self._config_summary(text)
+        # Find the WebGUI's certref.
         m = re.search(r"<webgui>.*?<ssl-certref>\s*([^<\s]*)\s*</ssl-certref>.*?</webgui>", text, re.DOTALL)
         if not (m and m.group(1)):
             # Readable config, no assignment: "" (heal-able), not None (unknown).
             logger.info("[cert] WebGUI on %s has no ssl-certref assigned in config", self.host)
             return ""
+        # The refid.
         return m.group(1)
 
     async def _webgui_cert_row(self, heal: bool = True) -> Optional[Tuple[Dict[str, Any], bool]]:
@@ -966,23 +1195,30 @@ class OpnsenseEngine:
         Primary: the config's ``ssl-certref`` matched to a Trust row's refid
         (works even when the live cert is stale, e.g. an HA backup whose cert
         store was replaced by sync). Fallback: the live TLS cert fingerprint."""
+        # Assigned refid, and Trust rows when there is one.
         certref = await self._webgui_certref()
         rows = await self._trust_cert_rows() if certref else None
         if certref:
+            # Find the row with that refid.
             for row in rows:
                 if row.get("refid") == certref:
                     der = self._row_der(row)
                     return row, bool(der and self._der_self_signed(der))
+            # Refid not in Trust.
             logger.info("[cert] WebGUI on %s is assigned cert refid %s, which is not in Trust "
                         "(e.g. replaced by HA sync)", self.host, certref)
+        # Fall back to the served cert.
         served = await self._served_cert_der()
         if not served:
             return None
+        # Load rows if not loaded yet.
         if rows is None:
             rows = await self._trust_cert_rows()
+        # Match by DER.
         for row in rows:
             if self._row_der(row) == served:
                 return row, self._der_self_signed(served)
+        # No match: log diagnostics.
         logger.info("[cert] WebGUI cert on %s matches no Trust certificate", self.host)
         self._log_webgui_diag(served, rows)
         if heal and certref is not None:
@@ -990,13 +1226,17 @@ class OpnsenseEngine:
             # webgui_configure_do() finds no cert for ssl-certref, creates a
             # "Web GUI TLS certificate" in Trust and assigns it (write_config),
             # which the caller can then replace in place.
+            # Restart the WebGUI.
             logger.info("[cert] restarting the WebGUI on %s to repair its cert assignment", self.host)
             await self._request("POST", "/api/core/service/restart/webgui", data={})
+            # Wait up to 30s for a new served cert.
             for _ in range(10):
                 await asyncio.sleep(3)
                 if await self._served_cert_der() not in (None, served):
                     break
+            # Try again once without healing.
             return await self._webgui_cert_row(heal=False)
+        # Not found.
         return None
 
     @staticmethod
@@ -1004,17 +1244,26 @@ class OpnsenseEngine:
         """Non-secret config excerpt for diagnostics: revision, webgui block and
         HA sync settings, with any password/key/secret elements removed."""
         def block(tag: str) -> str:
+            """The first ``<tag>`` element in the config, or a placeholder."""
+            # Find the element.
             m = re.search(rf"<{tag}>.*?</{tag}>", text, re.DOTALL)
             return m.group(0) if m else f"<{tag}/>(absent)"
+        # Revision, WebGUI and HA blocks.
         out = " ".join(block(t) for t in ("revision", "webgui", "hasync"))
+        # Mask secret elements.
         out = re.sub(r"<([\w-]*(?:pass|secret|key|prv)[\w-]*)>.*?</\1>", r"<\1>***</\1>", out,
                      flags=re.DOTALL | re.IGNORECASE)
+        # Collapse whitespace, cap at 1500 characters.
         return re.sub(r"\s+", " ", out)[:1500]
 
     def _log_webgui_diag(self, served: Optional[bytes], rows: List[Dict[str, Any]]) -> None:
+        """Log the served cert fingerprint and every Trust row, for diagnosing a cert mismatch."""
+        # Short sha256 fingerprint helper.
         import hashlib
         fp = lambda d: hashlib.sha256(d).hexdigest()[:16] if d else None  # noqa: E731
+        # Config excerpt.
         logger.info("[cert] diag %s config: %s", self.host, getattr(self, "_config_diag", "n/a"))
+        # Served cert and Trust rows.
         logger.info("[cert] diag %s served sha256=%s self_signed=%s; trust rows: %s", self.host,
                     fp(served), served and self._der_self_signed(served),
                     [(r.get("descr"), r.get("refid"), r.get("commonname"), r.get("in_use"),
@@ -1025,28 +1274,35 @@ class OpnsenseEngine:
         """True when subject == issuer (cryptography if installed, else the
         openssl CLI; False when neither can parse it)."""
         try:
+            # Try the cryptography library.
             from cryptography import x509  # type: ignore
             c = x509.load_der_x509_certificate(der)
             return c.subject == c.issuer
         except Exception:  # noqa: BLE001
+            # Not available or failed.
             pass
         try:
+            # Fall back to openssl.
             import subprocess
             out = subprocess.run(["openssl", "x509", "-inform", "DER", "-noout",
                                   "-subject", "-issuer", "-nameopt", "RFC2253"],
                                  input=der, capture_output=True, timeout=10).stdout.decode()
+            # Subject and issuer values.
             vals = [ln.split("=", 1)[1].strip() for ln in out.splitlines() if "=" in ln]
             return len(vals) == 2 and vals[0] == vals[1]
         except Exception:  # noqa: BLE001
+            # Could not parse.
             return False
 
     async def _remove_stale_duplicates(self, descr: str, keep_uuid: str) -> None:
         """Delete other Trust certs with the same descr that nothing uses
         (left by imports before WebGUI activation existed). OPNsense refuses
         to delete an in-use cert, so this is safe best-effort."""
+        # Unused certs with the same name, except the one kept.
         for row in await self._trust_cert_rows():
             if (row.get("descr") == descr and row.get("uuid") and row.get("uuid") != keep_uuid
                     and str(row.get("in_use", "0")) in ("0", "", "False", "false")):
+                # Delete and log.
                 res = await self._request("POST", f"/api/trust/cert/del/{row['uuid']}", data={})
                 logger.info("[cert] removed unused duplicate '%s' (%s): %s",
                             descr, row["uuid"], self._write_failure(res) or "ok")
@@ -1056,16 +1312,20 @@ class OpnsenseEngine:
         """Restart the WebGUI so it loads the updated cert, then confirm the
         live HTTPS cert is the new leaf. The restart drops the API connection
         mid-response, so a transport error from that call is expected."""
+        # Already serving the new leaf?
         want = self._pem_to_der(leaf_pem)
         if want and await self._served_cert_der() == want:
             return True
+        # Restart the WebGUI.
         res = await self._request("POST", "/api/core/service/restart/webgui", data={})
         logger.info("[cert] WebGUI restart requested: %s", res)
+        # Poll until the new cert is served.
         for _ in range(attempts):
             await asyncio.sleep(delay)
             if want and await self._served_cert_der() == want:
                 logger.info("[cert] WebGUI on %s now serves the new cert", self.host)
                 return True
+        # Still the old cert.
         logger.warning("[cert] WebGUI on %s still serves the previous cert after restart", self.host)
         return False
 
@@ -1076,15 +1336,20 @@ class OpnsenseEngine:
         ``{"result": "failed", "validations": {field: msg}}`` — never as an
         HTTP error — so checking only our own ``status == "ERROR"`` let a
         rejected import be reported as SUCCESS (and the hub never retried)."""
+        # Not a dict.
         if not isinstance(res, dict):
             return "unexpected response from OPNsense"
+        # Our own error envelope.
         if res.get("status") == "ERROR":
             return str(res.get("message") or "request failed")
+        # OPNsense validation failure.
         validations = res.get("validations")
         if str(res.get("result", "")).lower() == "failed" or validations:
             if isinstance(validations, dict) and validations:
+                # Field errors.
                 return "; ".join(f"{k}: {v}" for k, v in validations.items())
             return str(res.get("message") or "OPNsense rejected the request (result=failed)")
+        # Success.
         return None
 
     async def import_ca(self, descr: str, ca_pem: str) -> Dict[str, Any]:
@@ -1093,43 +1358,54 @@ class OpnsenseEngine:
         ``"ca"``: ``action:"existing"``, ``descr``, ``crt_payload`` (raw PEM). Needed
         before importing a leaf whose signing CA isn't already trusted, else
         OPNsense errors "missing CA key"."""
+        # A PEM is required.
         if not ca_pem:
             return {"status": "ERROR", "message": "import_ca requires a CA PEM"}
+        # CA payload, and any existing CA with this name.
         payload = {"action": "existing", "descr": descr, "crt_payload": ca_pem}
         uuid = await self._find_ca_uuid(descr)
+        # Update in place.
         if uuid:
             res = await self._request("POST", f"/api/trust/ca/set/{uuid}",
                                       data={"ca": payload},
                                       timeout=self._CERT_IMPORT_TIMEOUT)
             action = "updated"
         else:
+            # Otherwise add.
             res = await self._request("POST", "/api/trust/ca/add",
                                       data={"ca": payload},
                                       timeout=self._CERT_IMPORT_TIMEOUT)
             action = "added"
+        # Write failed?
         failure = self._write_failure(res)
         if failure:
             logger.info("[cert] CA '%s' import (%s) not applied: %s", descr, action, failure)
             return {"status": "ERROR", "message": failure}
+        # Success.
         return {"status": "SUCCESS", "message": f"ca '{descr}' {action}"}
 
     async def _find_ca_uuid(self, descr: str) -> Optional[str]:
         """Search Trust→Authorities for a CA whose ``descr`` matches; return its
         uuid or ``None``. Endpoint ``POST /api/trust/ca/search`` (rows carry
         ``uuid`` + ``descr``)."""
+        # A name is required.
         if not descr:
             return None
+        # Search; errors give None.
         try:
             res = await self._request("POST", "/api/trust/ca/search",
                                       data={"searchPhrase": descr, "search": descr})
         except Exception:
             return None
+        # Not a dict.
         if not isinstance(res, dict):
             return None
+        # First row with the same name.
         rows = res.get("rows") or res.get("data") or []
         for row in rows:
             if isinstance(row, dict) and row.get("descr") == descr and row.get("uuid"):
                 return row.get("uuid")
+        # Not found.
         return None
 
     @staticmethod
@@ -1138,11 +1414,14 @@ class OpnsenseEngine:
         first ``CERTIFICATE`` block; the remaining blocks (intermediates + root)
         are CA material for Trust→Authorities. Each returned block ends with a
         trailing newline (OPNsense parses PEM blocks cleanly regardless)."""
+        # All certificate blocks.
         blocks = re.findall(
             r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
             fullchain or "", re.DOTALL)
+        # None.
         if not blocks:
             return "", []
+        # Leaf first, then CAs.
         return blocks[0] + "\n", [b + "\n" for b in blocks[1:]]
 
     @staticmethod
@@ -1151,6 +1430,7 @@ class OpnsenseEngine:
         block (the leaf) from a fullchain PEM, or ``""`` if none. (Kept for
         callers/tests that only want the leaf; ``_split_chain`` is the fuller
         split used by ``import_cert``.)"""
+        # Leaf only.
         leaf, _ = OpnsenseEngine._split_chain(fullchain)
         return leaf
 
@@ -1158,44 +1438,56 @@ class OpnsenseEngine:
         """Search Trust→certs for one whose ``descr`` matches; return its uuid
         or ``None``. The OPNsense search endpoint is ``POST /api/trust/cert/search``
         (rows carry ``uuid`` + ``descr``)."""
+        # A name is required.
         if not descr:
             return None
+        # Search; errors give None.
         try:
             res = await self._request("POST", "/api/trust/cert/search",
                                       data={"searchPhrase": descr, "search": descr})
         except Exception:
             return None
+        # Not a dict.
         if not isinstance(res, dict):
             return None
+        # First row with the same name.
         rows = res.get("rows") or res.get("data") or []
         for row in rows:
             if isinstance(row, dict) and row.get("descr") == descr and row.get("uuid"):
                 return row.get("uuid")
+        # Not found.
         return None
 
     async def get_rules_for_ip(self, ip: str) -> Dict[str, Any]:
         """Fetches all firewall rules associated with a specific IP address."""
         # Fetch all rules and filter by source/destination IP in Python
         res_data = await self.get_all_firewall_rules()
+        # Fetch failed.
         if res_data.get("status") == "ERROR":
             return {"status": "ERROR", "details": res_data.get("details")}
 
+        # Rules, as a list.
         rules = res_data.get("data", [])
         if not isinstance(rules, list):
             # API might return a dict with a list under a key
             if isinstance(rules, dict):
+                # Values of the first key.
                 rules = list(rules.values())[0] if rules else []
             else:
+                # Unexpected shape.
                 rules = []
 
+        # Rules mentioning the IP.
         filtered_rules = [
             rule for rule in rules
             if ip in str(rule.get("source", "")) or ip in str(rule.get("destination", ""))
         ]
 
+        # None.
         if not filtered_rules:
             return {"status": "SUCCESS", "ip": ip, "rules": [], "source": "empty"}
 
+        # Success.
         return {"status": "SUCCESS", "ip": ip, "rules": filtered_rules}
 
     async def get_dhcp_leases(self, limit: int = 200) -> Dict[str, Any]:
@@ -1206,14 +1498,17 @@ class OpnsenseEngine:
         path. The firewall→NetBox discovery sync passes ``limit=0`` to get the
         full lease set (it bypasses the capped cache at the spoke layer).
         """
+        # Fetch leases.
         res = await self._request("GET", "/api/kea/leases4/search")
 
+        # Expect a dict.
         if isinstance(res, dict):
             # A _request ERROR envelope has no "rows" — classify it BEFORE the
             # rows-is-None path so an API blip isn't returned as SUCCESS+[] (which
             # feeds "zero leases" into the NetBox discovery sync at limit=0).
             if res.get("status") == "ERROR" or "error" in res or "errorMessage" in res:
                 return {"status": "ERROR", "details": res}
+            # Rows; none means empty.
             rows = res.get("rows")
             if rows is None:
                 logger.info(f"Kea DHCP API returned success but no leases found. Response: {res}")
@@ -1223,9 +1518,11 @@ class OpnsenseEngine:
             # instead of a list) — flatten so we don't silently drop every lease.
             if isinstance(rows, dict):
                 rows = list(rows.values())
+            # Guard against a non-list.
             if not isinstance(rows, list):
                 rows = []
 
+            # Map each lease.
             processed_leases = []
             for lease in rows:
                 if isinstance(lease, dict):
@@ -1246,8 +1543,10 @@ class OpnsenseEngine:
                 logger.warning(f"Truncating DHCP leases from {len(processed_leases)} to {limit} for stability")
                 processed_leases = processed_leases[:limit]
 
+            # Success.
             return {"status": "SUCCESS", "data": processed_leases}
 
+        # Not a dict.
         return {"status": "ERROR", "message": "Unexpected API response format"}
 
     async def get_arp_table(self) -> Dict[str, Any]:
@@ -1261,28 +1560,36 @@ class OpnsenseEngine:
         wants the full neighbor set. The MAC is returned raw; the hub/netbox
         normalize it.
         """
+        # Fetch the ARP table.
         res = await self._request("GET", "/api/diagnostics/interface/search_arp")
 
+        # Expect a dict.
         if isinstance(res, dict):
             # Classify a _request ERROR envelope before treating a missing "rows"
             # as "no neighbors" (an API blip must not read as an empty ARP table).
             if res.get("status") == "ERROR" or "error" in res or "errorMessage" in res:
                 return {"status": "ERROR", "details": res}
+            # Rows.
             rows = res.get("rows")
             if rows is None:
                 # Some OPNsense versions return the list under a different key.
                 rows = res.get("data") or []
+            # Guard against a non-list.
             if not isinstance(rows, list):
                 rows = []
 
+            # Map each entry.
             arp = []
             for row in rows:
+                # Skip non-dict rows.
                 if not isinstance(row, dict):
                     continue
+                # IP and MAC; skip rows with neither.
                 ip = (row.get("ip") or row.get("address") or "").strip()
                 mac = (row.get("mac") or row.get("hwaddr") or "").strip()
                 if not ip and not mac:
                     continue
+                # Add the row.
                 arp.append({
                     "ip": ip or "unknown",
                     "mac": mac or "unknown",
@@ -1290,8 +1597,10 @@ class OpnsenseEngine:
                     "interface": (row.get("intf") or row.get("interface") or "").strip(),
                 })
 
+            # Success.
             return {"status": "SUCCESS", "data": arp}
 
+        # Not a dict.
         return {"status": "ERROR", "message": "Unexpected ARP API response format"}
 
     # ------------------------------------------------------------------
@@ -1307,11 +1616,15 @@ class OpnsenseEngine:
         12 chars, return the stripped lowercased input unchanged so partial
         fragments (e.g. ``aa:bb``) still flow through substring matching.
         """
+        # Empty input.
         if not raw:
             return ""
+        # Hex digits only.
         s = re.sub(r"[^0-9a-fA-F]", "", raw or "").lower()
+        # Not a full MAC: return as typed.
         if len(s) != 12:
             return (raw or "").strip().lower()
+        # Colon form.
         return ":".join(s[i:i + 2] for i in range(0, 12, 2))
 
     @staticmethod
@@ -1321,19 +1634,26 @@ class OpnsenseEngine:
         Bad CIDRs / IPs are silently skipped (never raise) — a malformed
         tenant prefix must not blank out the whole search.
         """
+        # ipaddress for parsing.
         import ipaddress
+        # Need an IP and prefixes.
         if not ip_str or not prefixes:
             return False
+        # Parse the IP.
         try:
             addr = ipaddress.ip_address(ip_str)
         except ValueError:
+            # Not an IP.
             return False
+        # Check each prefix; skip bad ones.
         for cidr in prefixes:
             try:
                 if addr in ipaddress.ip_network(cidr, strict=False):
                     return True
             except ValueError:
+                # Bad prefix.
                 continue
+        # No match.
         return False
 
     async def get_dhcp_static_mappings(self) -> Dict[str, Any]:
@@ -1345,42 +1665,52 @@ class OpnsenseEngine:
         fall back to the dynamic-lease names too so a schema drift doesn't
         drop every reservation. Returns ``{id, ip, mac, hostname}`` rows.
         """
+        # Fetch reservations.
         res = await self._request("GET", "/api/kea/dhcp4/searchReserved")
 
+        # Expect a dict.
         if isinstance(res, dict):
             # Same ERROR-envelope classification as get_dhcp_leases — an API
             # blip must not read as SUCCESS+[] (search would silently miss
             # all reservations).
             if res.get("status") == "ERROR" or "error" in res or "errorMessage" in res:
                 return {"status": "ERROR", "details": res}
+            # Rows, under rows or data; none means empty.
             rows = res.get("rows")
             if rows is None:
                 rows = res.get("data")
             if rows is None:
                 logger.info(f"Kea reservations API returned success but no rows. Response: {res}")
                 return {"status": "SUCCESS", "data": [], "source": "empty"}
+            # Flatten a dict and guard against a non-list.
             if isinstance(rows, dict):
                 rows = list(rows.values())
             if not isinstance(rows, list):
                 rows = []
 
+            # Map each reservation.
             mappings = []
             for row in rows:
+                # Skip non-dict rows.
                 if not isinstance(row, dict):
                     continue
+                # IP, MAC and hostname; skip rows with no IP or MAC.
                 ip = (row.get("ip-address") or row.get("address") or row.get("ip") or "").strip()
                 mac = (row.get("hw-address") or row.get("hwaddr") or row.get("mac") or "").strip()
                 host = (row.get("hostname") or row.get("host") or "").strip()
                 if not ip and not mac:
                     continue
+                # Add the row.
                 mappings.append({
                     "id": (row.get("uuid") or ip or "").strip(),
                     "ip": ip or "unknown",
                     "mac": mac or "unknown",
                     "hostname": host or "unknown",
                 })
+            # Success.
             return {"status": "SUCCESS", "data": mappings}
 
+        # Not a dict.
         return {"status": "ERROR", "message": "Unexpected API response format"}
 
     async def search_dhcp(self, q: str,
@@ -1402,14 +1732,19 @@ class OpnsenseEngine:
         Returns ``{status, results, count}`` where each result dict carries
         at minimum ``source``, ``type``, ``name``, ``ip``, ``mac``.
         """
+        # Unexpected failures return an ERROR result.
         try:
+            # Lowercase query and its MAC form.
             q_low = (q or "").strip().lower()
             q_mac = self._normalize_mac(q or "")
             has_prefixes = bool(prefixes)
 
             def _matches(ip: str, host: str, mac: str) -> bool:
+                """True if the query appears in the IP, hostname or MAC."""
+                # Empty query matches nothing.
                 if not q_low:
                     return False
+                # Compare against the normalised MAC too.
                 mac_norm = self._normalize_mac(mac)
                 return (q_low in (ip or "").lower() or
                         q_low in (host or "").lower() or
@@ -1417,25 +1752,33 @@ class OpnsenseEngine:
                         q_low in mac_norm)
 
             def _in_scope(ip_str: str) -> bool:
+                """True if the IP is visible to this caller."""
+                # With prefixes: inside one of them.
                 if has_prefixes:
                     return self._ip_in_prefixes(ip_str, prefixes or [])
                 # No prefixes: admin sees everything, non-admin sees nothing.
                 return bool(is_admin)
 
+            # Collected results.
             results: List[Dict[str, Any]] = []
 
             # --- dynamic leases ---
             try:
+                # Leases; a failure is only logged.
                 leases_r = await self.get_dhcp_leases()
+                # Matching, in-scope leases.
                 if leases_r.get("status") == "SUCCESS":
                     for lease in leases_r.get("data", []):
+                        # Fields.
                         ip = lease.get("ip", "") or ""
                         host = lease.get("hostname", "") or ""
                         mac = lease.get("mac", "") or ""
+                        # Skip non-matches and out-of-scope IPs.
                         if not _matches(ip, host, mac):
                             continue
                         if not _in_scope(ip):
                             continue
+                        # Add the result.
                         results.append({
                             "source": "opnsense",
                             "type": "dhcp_lease",
@@ -1447,20 +1790,26 @@ class OpnsenseEngine:
                             "lease_end": lease.get("lease_end", ""),
                         })
             except Exception as e:
+                # Leases failed.
                 logger.warning(f"search_dhcp dynamic-leases leg failed: {e}")
 
             # --- static mappings (reservations) ---
             try:
+                # Reservations; a failure is only logged.
                 static_r = await self.get_dhcp_static_mappings()
+                # Matching, in-scope reservations.
                 if static_r.get("status") == "SUCCESS":
                     for sm in static_r.get("data", []):
+                        # Fields.
                         ip = sm.get("ip", "") or ""
                         host = sm.get("hostname", "") or ""
                         mac = sm.get("mac", "") or ""
+                        # Skip non-matches and out-of-scope IPs.
                         if not _matches(ip, host, mac):
                             continue
                         if not _in_scope(ip):
                             continue
+                        # Add the result.
                         results.append({
                             "source": "opnsense",
                             "type": "dhcp_static",
@@ -1471,9 +1820,12 @@ class OpnsenseEngine:
                             "state": "reserved",
                         })
             except Exception as e:
+                # Reservations failed.
                 logger.warning(f"search_dhcp static-mappings leg failed: {e}")
 
+            # Success.
             return {"status": "SUCCESS", "results": results, "count": len(results)}
         except Exception as e:
+            # Log and return the error.
             logger.exception("search_dhcp failed")
             return {"status": "ERROR", "message": f"DHCP search failed: {e}"}
