@@ -4,6 +4,24 @@ The **OPNsense Spoke** (`module_type = "firewall"`) connects the Lab Manager Hub
 
 ---
 
+## Repository layout
+
+| Path | What it holds |
+| :--- | :--- |
+| `.claude/` | Fleet-owned skills, synced from lm; edit them in lm. |
+| `.github/` | CI (`workflows/ci.yml`), the thin `promote`/`backmerge` callers, promotion scripts and fleet-owned agents. |
+| `docs/` | This module's docs (copies of the canonical pages in `lm/docs`). |
+| `plugin/` | The `netimpair` OPNsense plugin (network impairment). |
+| `src/` | The spoke's Python source (entry point, engine, control plane). |
+| `tests/` | pytest suite; CI runs it in the `test` job. |
+| `AGENTS.md` | Orientation for people and AI agents; the fleet rules block is synced from lm. |
+| `API_SPEC.md` | The commands and routes this spoke exposes. |
+| `install_opnsense.sh` | Installer (idempotent; safe to re-run). |
+| `opnsense.Dockerfile` | Container build. |
+| `README.md` | This file. |
+| `requirements.txt` | Runtime Python dependencies. |
+| `VERSION` | Bot-owned version; promotion bumps it. Never edit by hand. |
+
 ## Architecture Overview
 
 The spoke dials the Lab Manager Hub over an outbound TLS WebSocket connection (`wss://<hub>:443/ws/spoke`) using the standard mailbox push-ack-retry contract (`BaseSpoke`). It translates commands received from the hub into HTTPS REST API calls against the target OPNsense firewall (default port 8443).
