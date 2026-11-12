@@ -142,7 +142,9 @@ def test_engine_perf_sample_reads_counters_and_gauges():
     assert data["time"] == NOW and data["metrics"] == {"cpu": 5.0, "mem": 25.0, "states": 42.0}
     assert data["interfaces"]["WAN"] == {"in_bytes": 100, "out_bytes": 200, "in_pkts": 3,
                                          "out_pkts": 4, "in_errs": 0, "out_errs": 1}
-    # Replies that are empty or say "failed" are not data.
+    # Replies that are empty or say "failed" are not data, nor is a row without counters.
+    replies["/api/diagnostics/traffic/interface"]["interfaces"]["lan"] = {"name": "LAN", "x": "?"}
+    assert "LAN" not in _run(eng.get_perf_sample())["data"]["interfaces"]
     replies.update({k: {"result": "failed"} for k in list(replies)[:2]})
     replies.update({k: {} for k in list(replies)[2:]})
     assert _run(eng.get_perf_sample())["status"] == "ERROR"
