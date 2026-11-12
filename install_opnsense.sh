@@ -184,6 +184,8 @@ fi
 # .git/objects → "insufficient permission for adding an object" → self-update
 # fails. Hand the repo to svc_lm + trust the dir (mirrors cs/netbox installers).
 chown -R svc_lm:svc_lm "$SPOKE_PATH" 2>/dev/null || true
+# Performance history (7 days of 5-minute averages, perf.json) lives here.
+install -d -o svc_lm -g svc_lm /var/lib/lm-opnsense 2>/dev/null || true
 runuser -u svc_lm -- git config --global --add safe.directory "$SPOKE_PATH" 2>/dev/null || true
 
 echo "🛠️ Setting up OPNsense Manager..."

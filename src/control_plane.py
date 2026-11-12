@@ -102,6 +102,9 @@ class OpnControlPlane(BaseControlPlane):
         # Integrate with Lab Manager's native spoke structure
         opn_spoke = OpnSpoke(self.spoke_id, self.config)
         self.register_module("opn", opn_spoke)
+        # Give the spoke the hub link and start performance sampling.
+        opn_spoke.control_plane = self
+        opn_spoke.start_background_loops()
 
         # Delegate to BaseControlPlane's main loop
         await self.run()
