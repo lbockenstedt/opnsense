@@ -20,6 +20,9 @@ logger = logging.getLogger("OpnPerfStore")
 
 BUCKET_S = 300
 KEEP_S = 7 * 86400
+# Samples further apart than this (missed samples, firewall unreachable) give
+# no rate: one averaged over the whole gap would pass for a normal minute.
+MAX_GAP_S = 180
 DATA_DIR = os.getenv("LM_OPNSENSE_DATA_DIR", "/var/lib/lm-opnsense")
 
 # Counter name in a sample -> metric suffix and multiplier (bytes -> bits).
@@ -35,11 +38,12 @@ def counter_rates(prev: Dict[str, Any], cur: Dict[str, Any]) -> Dict[str, float]
     Returns totals (``in_bps``, ``out_bps``, ``in_pps``, ``out_pps``,
     ``errps``) plus ``if:<name>:<in|out>_<bps|pps>`` per interface. An interface whose
     counter went down (a reboot or counter reset) or that is missing from the
-    previous sample is left out of this interval.
+    previous sample is left out of this interval. Samples more than
+    ``MAX_GAP_S`` apart give no rates.
     """
     # No usable interval: no rates.
     seconds = (cur or {}).get("time", 0) - (prev or {}).get("time", 0)
-    if not prev or seconds <= 0:
+    if not prev or seconds <= 0 or seconds > MAX_GAP_S:
         return {}
     out: Dict[str, float] = {}
     before = prev.get("interfaces") or {}

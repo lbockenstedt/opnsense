@@ -135,7 +135,9 @@ class OpnSpoke(BaseSpoke):
                 # Rates need the previous counters; gauges are used as they are.
                 metrics = dict(sample["metrics"])
                 metrics.update(counter_rates(self._perf_prev, sample))
-                self._perf_prev = sample
+                # A sample without counters must not replace good ones.
+                if sample.get("interfaces"):
+                    self._perf_prev = sample
                 if metrics:
                     self.perf.add(device_id, metrics, now)
         closed = self.perf.close_finished(now)
@@ -152,7 +154,8 @@ class OpnSpoke(BaseSpoke):
         # old to know module "opnsense" ignores it.
         sent = await cp.send_to_hub("STORAGE_PERF_SAMPLE",
                                     {"module": "opnsense", "samples": batch})
-        if sent is not False:
+        # Only a confirmed send counts; anything else is retried next minute.
+        if sent is True:
             await asyncio.to_thread(self.perf_store.mark_sent, batch)
 
     async def _cache_refresh_loop(self):

@@ -37,6 +37,8 @@ def test_counter_rates_and_reset():
     assert "if:WAN:in_bps" not in rates and rates["in_bps"] == 800
     # No previous sample, or no time passed: no rates.
     assert counter_rates(None, first) == {} and counter_rates(first, first) == {}
+    # A gap (missed samples) gives no rate rather than one averaged over the gap.
+    assert counter_rates(first, _counters(NOW + 600, 9000, 9000)) == {}
 
 
 def test_store_prunes_after_7_days_and_serves_a_range(tmp_path):
@@ -99,6 +101,27 @@ def test_tick_keeps_buckets_unsent_while_the_hub_is_away(tmp_path):
     assert [r["ts"] for r in spoke.perf_store.unsent()] == [start]
 
 
+def test_tick_marks_sent_only_on_a_confirmed_send_and_keeps_good_counters(tmp_path):
+    spoke = _spoke(tmp_path)
+    hub = spoke.control_plane = _Hub()
+
+    async def unconfirmed(kind, data):
+        hub.sent.append((kind, data))
+    hub.send_to_hub = unconfirmed
+    start = (NOW // 300) * 300 + 300
+    for i in range(6):
+        _run(spoke._perf_sample_tick(start + i * 60))
+    assert hub.sent and [r["ts"] for r in spoke.perf_store.unsent()] == [start]
+    # A sample with no interface counters keeps the previous counters.
+    good = spoke._perf_prev
+
+    async def no_traffic():
+        return {"status": "SUCCESS", "data": {"time": NOW, "interfaces": {}, "metrics": {"cpu": 1}}}
+    spoke.engine.get_perf_sample = no_traffic
+    _run(spoke._perf_sample_tick(start + 360))
+    assert spoke._perf_prev is good
+
+
 def test_engine_perf_sample_reads_counters_and_gauges():
     from opnsense_engine import OpnsenseEngine
     eng = OpnsenseEngine(host="fw:8443", api_key="k", api_secret="s")
@@ -119,3 +142,7 @@ def test_engine_perf_sample_reads_counters_and_gauges():
     assert data["time"] == NOW and data["metrics"] == {"cpu": 5.0, "mem": 25.0, "states": 42.0}
     assert data["interfaces"]["WAN"] == {"in_bytes": 100, "out_bytes": 200, "in_pkts": 3,
                                          "out_pkts": 4, "in_errs": 0, "out_errs": 1}
+    # Replies that are empty or say "failed" are not data.
+    replies.update({k: {"result": "failed"} for k in list(replies)[:2]})
+    replies.update({k: {} for k in list(replies)[2:]})
+    assert _run(eng.get_perf_sample())["status"] == "ERROR"
