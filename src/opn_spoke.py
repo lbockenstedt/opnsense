@@ -4,12 +4,14 @@ It caches read-heavy API responses, refreshes them in the background, and
 handles certificate installs and network impairment commands.
 """
 # Standard library, the shared base spoke, the engine and impairments.
+import asyncio
 import logging
 import subprocess
 import time
 from typing import Dict, Any
 from core.src.base_spoke import BaseSpoke
 from opnsense_engine import OpnsenseEngine
+from perf_store import PerfAverager, PerfStore, counter_rates
 import impairments
 
 # Module logger.
@@ -75,6 +77,14 @@ class OpnSpoke(BaseSpoke):
         self._refresh_interval = config.get("refresh_interval", 3600) # seconds, default 1h
         self._refresh_task = None
 
+        # Performance history: the hub link (set by the control plane), the
+        # 5-minute averager, the 7-day store and the last counter sample.
+        self.control_plane = None
+        self.perf = PerfAverager()
+        self.perf_store = PerfStore()
+        self._perf_prev = None
+        self._bg_tasks = []
+
         # Start the base spoke, then the refresh loop.
         super().__init__(spoke_id, config)
         self._start_refresh_loop()
@@ -92,6 +102,58 @@ class OpnSpoke(BaseSpoke):
             # Fallback if the loop isn't running yet during initialization
             # No loop yet.
             logger.warning("Event loop not running; refresh loop will be started manually or on first request")
+
+    # Performance is sampled this often and averaged into 5-minute buckets.
+    _PERF_SAMPLE_S = 60
+
+    def start_background_loops(self) -> None:
+        """Start the performance sampling loop once. Called by the standalone
+        control plane and by the generic agent's role hook."""
+        if self._bg_tasks:
+            return
+        self._bg_tasks = [asyncio.create_task(self._perf_sample_loop())]
+        logger.info("opnsense performance sampling loop started")
+
+    async def _perf_sample_loop(self):
+        """Sample the firewall every minute and push 5-minute averages."""
+        while True:
+            await asyncio.sleep(self._PERF_SAMPLE_S)
+            try:
+                await self._perf_sample_tick(time.time())
+            except Exception as e:  # noqa: BLE001 - loop must never die
+                logger.debug("opnsense perf sample tick error: %s", e)
+
+    async def _perf_sample_tick(self, now: float):
+        """Take one sample, close ended buckets, store them and push the
+        buckets the hub hasn't received yet."""
+        # The hub's firewall id names the series; no id means not configured yet.
+        device_id = (self.config or {}).get("id")
+        if device_id and self.engine.is_configured():
+            res = await self.engine.get_perf_sample()
+            if res.get("status") == "SUCCESS":
+                sample = res["data"]
+                # Rates need the previous counters; gauges are used as they are.
+                metrics = dict(sample["metrics"])
+                metrics.update(counter_rates(self._perf_prev, sample))
+                self._perf_prev = sample
+                if metrics:
+                    self.perf.add(device_id, metrics, now)
+        closed = self.perf.close_finished(now)
+        if closed:
+            await asyncio.to_thread(self.perf_store.add, closed, now)
+        # Send what the hub hasn't received; unsent buckets wait on disk.
+        cp = self.control_plane
+        if cp is None or getattr(cp, "_hub_ws", None) is None:
+            return
+        batch = await asyncio.to_thread(self.perf_store.unsent)
+        if not batch:
+            return
+        # STORAGE_PERF_SAMPLE is the hub's generic perf message; a hub too
+        # old to know module "opnsense" ignores it.
+        sent = await cp.send_to_hub("STORAGE_PERF_SAMPLE",
+                                    {"module": "opnsense", "samples": batch})
+        if sent is not False:
+            await asyncio.to_thread(self.perf_store.mark_sent, batch)
 
     async def _cache_refresh_loop(self):
         """Background loop to refresh the cache periodically.
@@ -320,6 +382,19 @@ class OpnSpoke(BaseSpoke):
 
             # Done.
             return {"status": "SUCCESS", "message": "OPNsense configuration updated from Hub"}
+
+        # Performance history (5-minute averages) for a start/end range.
+        if normalized_cmd == "OPNSENSE_GET_PERF_HISTORY":
+            rng = data or {}
+            try:
+                end = float(rng.get("end") or time.time())
+                start = float(rng.get("start") or end - 86400)
+            except (TypeError, ValueError):
+                return {"status": "ERROR", "message": "start/end must be epoch seconds"}
+            device_id = (self.config or {}).get("id") or ""
+            rows = await asyncio.to_thread(self.perf_store.history, device_id, start, end)
+            return {"status": "SUCCESS", "interval": 300, "data": rows,
+                    "message": f"{len(rows)} 5-minute average(s)"}
 
         # Spoke version.
         if normalized_cmd == "GET_VERSION":
