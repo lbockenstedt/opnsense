@@ -37,6 +37,11 @@ The OPNsense Spoke acts as a bridge between the Lab Manager Hub and the OPNsense
   - **Purpose**: Dashboard snapshot for the Firewalls → Overview tab. Always live (not cached by the spoke). Each section is best-effort: a section the API key can't read is left empty.
   - **Payload**: `{}`
   - **Response**: `{"status": "SUCCESS", "data": {"hostname", "version", "uptime", "loadavg", "cpu_percent", "memory": {"used", "total", "percent"}, "gateways": [{"name", "address", "status", "online", "delay", "loss"}], "interfaces": [{"name", "in_bps", "out_bps"}]}}`
+- **`OPNSENSE_GET_PERF_HISTORY`**
+  - **Purpose**: Performance history for the Firewalls → Overview charts: 5-minute averages the spoke keeps for 7 days (`src/perf_store.py`).
+  - **Payload**: `{"start": epoch, "end": epoch}` (default: the last 24 hours)
+  - **Response**: `{"status": "SUCCESS", "interval": 300, "data": [{"ts", "samples", "metrics": {"in_bps", "out_bps", "in_pps", "out_pps", "errps", "cpu", "mem", "states", "if:<interface>:in_bps", ...}}]}`
+  - **Push**: each new bucket is also sent unsolicited to the hub as `STORAGE_PERF_SAMPLE` `{"module": "opnsense", "samples": [{"device_id", "ts", "samples", "metrics"}]}`.
 - **`OPNSENSE_GET_RULES_BY_IP`**
   - **Purpose**: Filters firewall rules associated with a specific IP.
   - **Payload**: `{"ip": "string"}`
