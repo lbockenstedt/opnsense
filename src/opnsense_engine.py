@@ -426,6 +426,71 @@ class OpnsenseEngine:
         # Success.
         return {"status": "SUCCESS", "data": overview}
 
+    async def get_perf_sample(self) -> Dict[str, Any]:
+        """One performance sample for the history charts (``perf_store``).
+
+        Returns ``{"status": "SUCCESS", "data": {"time", "interfaces",
+        "metrics"}}``. ``interfaces`` holds the raw byte/packet/error counters
+        per interface name (``in_bytes``, ``out_bytes``, ``in_pkts``,
+        ``out_pkts``, ``in_errs``, ``out_errs``); the spoke turns them into
+        rates. ``metrics`` holds the gauges: ``cpu`` and ``mem`` (percent) and
+        ``states`` (pf state-table entries). Each part is best-effort; a part
+        the API refuses is simply missing."""
+        def ok(res):
+            """True for a non-empty reply that is not an error: not our
+            ERROR envelope and not OPNsense's ``{"result": "failed"}``."""
+            return (isinstance(res, dict) and bool(res) and res.get("status") != "ERROR"
+                    and res.get("result") != "failed")
+
+        def num(value):
+            """``value`` as a float, or None if it is not numeric."""
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        # All four calls at once (the activity call runs ``top`` for ~2s).
+        traffic, resources, activity, states = await asyncio.gather(
+            self._request("GET", "/api/diagnostics/traffic/interface"),
+            self._request("GET", "/api/diagnostics/system/system_resources"),
+            self._request("GET", "/api/diagnostics/activity/get_activity"),
+            self._request("GET", "/api/diagnostics/firewall/pf_states"),
+        )
+        if not any(ok(r) for r in (traffic, resources, activity, states)):
+            return {"status": "ERROR", "message": "Firewall unreachable"}
+        sample = {"time": time.time(), "interfaces": {}, "metrics": {}}
+
+        # Interface counters, keyed by the interface's display name.
+        if ok(traffic):
+            sample["time"] = num(traffic.get("time")) or sample["time"]
+            fields = (("bytes received", "in_bytes"), ("bytes transmitted", "out_bytes"),
+                      ("packets received", "in_pkts"), ("packets transmitted", "out_pkts"),
+                      ("input errors", "in_errs"), ("output errors", "out_errs"))
+            for key, row in (traffic.get("interfaces") or {}).items():
+                if not isinstance(row, dict):
+                    continue
+                counters = {name: num(row.get(field)) for field, name in fields}
+                counters = {k: v for k, v in counters.items() if v is not None}
+                # A row with no numeric counter is not data.
+                if counters:
+                    sample["interfaces"][row.get("name") or key] = counters
+        # CPU busy percent from top's "... 96.4% idle" header.
+        if ok(activity):
+            for line in activity.get("headers") or []:
+                idle = re.search(r"CPU:.*?([\d.]+)% idle", line)
+                if idle:
+                    sample["metrics"]["cpu"] = round(100 - float(idle.group(1)), 1)
+        # Memory use percent.
+        memory = resources.get("memory") if ok(resources) else None
+        if isinstance(memory, dict):
+            used, total = num(memory.get("used")), num(memory.get("total"))
+            if used is not None and total:
+                sample["metrics"]["mem"] = round(used * 100 / total, 1)
+        # pf state-table entries ({"current": "123", "limit": "..."}).
+        if ok(states) and num(states.get("current")) is not None:
+            sample["metrics"]["states"] = num(states.get("current"))
+        return {"status": "SUCCESS", "data": sample}
+
     async def get_all_firewall_rules(self) -> Dict[str, Any]:
         """Fetches all firewall rules across all interfaces."""
         # Search all rules.
