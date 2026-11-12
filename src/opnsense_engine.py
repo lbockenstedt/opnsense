@@ -437,8 +437,10 @@ class OpnsenseEngine:
         ``states`` (pf state-table entries). Each part is best-effort; a part
         the API refuses is simply missing."""
         def ok(res):
-            """True if the result is a dict and not an ERROR."""
-            return isinstance(res, dict) and res.get("status") != "ERROR"
+            """True for a non-empty reply that is not an error: not our
+            ERROR envelope and not OPNsense's ``{"result": "failed"}``."""
+            return (isinstance(res, dict) and bool(res) and res.get("status") != "ERROR"
+                    and res.get("result") != "failed")
 
         def num(value):
             """``value`` as a float, or None if it is not numeric."""
@@ -468,8 +470,10 @@ class OpnsenseEngine:
                 if not isinstance(row, dict):
                     continue
                 counters = {name: num(row.get(field)) for field, name in fields}
-                sample["interfaces"][row.get("name") or key] = {
-                    k: v for k, v in counters.items() if v is not None}
+                counters = {k: v for k, v in counters.items() if v is not None}
+                # A row with no numeric counter is not data.
+                if counters:
+                    sample["interfaces"][row.get("name") or key] = counters
         # CPU busy percent from top's "... 96.4% idle" header.
         if ok(activity):
             for line in activity.get("headers") or []:
