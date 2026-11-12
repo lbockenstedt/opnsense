@@ -154,7 +154,9 @@ class OpnSpoke(BaseSpoke):
         # old to know module "opnsense" ignores it.
         sent = await cp.send_to_hub("STORAGE_PERF_SAMPLE",
                                     {"module": "opnsense", "samples": batch})
-        # Only a confirmed send counts; anything else is retried next minute.
+        # lm core's send_to_hub (core/src/messaging/control_plane.py) returns
+        # True once the frame is written and False otherwise, never None. Only
+        # a confirmed send counts; anything else is retried next minute.
         if sent is True:
             await asyncio.to_thread(self.perf_store.mark_sent, batch)
 

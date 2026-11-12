@@ -470,8 +470,10 @@ class OpnsenseEngine:
                 if not isinstance(row, dict):
                     continue
                 counters = {name: num(row.get(field)) for field, name in fields}
-                sample["interfaces"][row.get("name") or key] = {
-                    k: v for k, v in counters.items() if v is not None}
+                counters = {k: v for k, v in counters.items() if v is not None}
+                # A row with no numeric counter is not data.
+                if counters:
+                    sample["interfaces"][row.get("name") or key] = counters
         # CPU busy percent from top's "... 96.4% idle" header.
         if ok(activity):
             for line in activity.get("headers") or []:
