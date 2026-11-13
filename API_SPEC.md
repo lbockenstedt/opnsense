@@ -90,12 +90,15 @@ API key with the *Firewall: Shaper* and *Firewall: Shaper: Impairment*
 privileges. Each impairment is a Traffic Shaper pipe + rule per direction plus a
 netimpair entry, all tagged `lm-impair:<id>:<down|up>` in their description
 (`src/impairments.py`). Without the plugin every command returns an ERROR
-saying so.
+saying so. OPNsense refuses pipes faster than 4 Gbit/s (dummynet keeps bits/s in
+32 bits), so a pipe without a bandwidth limit is created at 4 Gbit/s and a
+limit above 4 Gbit/s (compared in bits/s, whatever the unit) is rejected with
+"OPNsense pipes are limited to 4 Gbit/s".
 - **`OPNSENSE_GET_IMPAIRMENTS`**
   - **Payload**: `{}`
-  - **Response**: `{"status": "SUCCESS", "data": [{"uuid", "target", "interface", "direction", "delay", "loss", "description", "enabled", "complete"}]}`
+  - **Response**: `{"status": "SUCCESS", "data": [{"uuid", "target", "interface", "direction", "delay", "loss", "bandwidth", "bandwidth_unit", "description", "enabled", "complete"}]}`; `bandwidth` 0 means no limit.
 - **`OPNSENSE_ADD_IMPAIRMENT`**
-  - **Payload**: `{"target": "10.0.0.5" | "10.0.0.0/24", "interface": "lan", "direction": "both|download|upload", "delay": ms (0-10000), "loss": % (0-100), "description": "", "enabled": "1"}`
+  - **Payload**: `{"target": "10.0.0.5" | "10.0.0.0/24", "interface": "lan", "direction": "both|download|upload", "delay": ms (0-10000), "loss": % (0-100), "bandwidth": optional whole number (blank/0 = no limit), "bandwidth_unit": "Kbit|Mbit|Gbit" (default Mbit, at most 4 Gbit/s in total), "description": "", "enabled": "1"}`. At least one of delay, loss or bandwidth must be set.
   - **Response**: `{"status": "SUCCESS", "uuid": "<id>"}`. A failed step deletes what was already created.
 - **`OPNSENSE_EDIT_IMPAIRMENT`**
   - **Payload**: the add payload plus `"uuid"`. The new version is built before the old one is removed, so a failed edit keeps the original; the response carries the new `uuid`.

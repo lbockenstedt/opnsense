@@ -48,6 +48,7 @@ OPNsense REST over HTTPS at `https://{host}:{port}` (`OpnsenseEngine`). Default 
 - Aliases: `OPNSENSE_ADD/DEL/EDIT/UPDATE_ALIAS`. Categories resolved to UUIDs (see below).
 - NAT: `OPNSENSE_ADD/DEL/EDIT_NAT_RULE` (`nat_type` `d_nat`/`source_nat`/`one_to_one`/`nat_1to1` alias).
 - DNS: `OPNSENSE_ADD/DEL/EDIT_DNS_RECORD` (Unbound host overrides).
+- Impairment: `OPNSENSE_GET/ADD/EDIT/DEL_IMPAIRMENT` (`src/impairments.py`): latency, packet loss and an optional bandwidth limit for a host or subnet, via a Traffic Shaper pipe and rule per direction plus the `os-netimpair` plugin. OPNsense refuses pipes faster than 4 Gbit/s, so a pipe with no limit is made at 4 Gbit/s and a higher limit is rejected ("OPNsense pipes are limited to 4 Gbit/s"). Always live (not cached).
 - `OPNSENSE_INSTALL_CERT` — hub-brokered cert distribution: applies `fullchain`+`privkey` via `/api/trust/cert/add` or `set/{uuid}`. `privkey` masked.
 
 ## Key files

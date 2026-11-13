@@ -3,7 +3,8 @@
 One LM impairment is built from plain OPNsense objects, all tagged in their
 description with ``lm-impair:<id>:<down|up>``:
 
-* a Traffic Shaper pipe per direction (10 Gbit/s, so it only delays/drops),
+* a Traffic Shaper pipe per direction, at the optional bandwidth limit or
+  else at 4 Gbit/s (the fastest pipe OPNsense accepts, so it only delays/drops),
 * a Traffic Shaper rule per direction sending the host/subnet's traffic into
   that pipe on the chosen interface (download = to the target, ``out`` on the
   interface; upload = from the target, ``in``),
@@ -43,6 +44,13 @@ PLUGIN_MISSING = ("The os-netimpair plugin is not installed on this firewall "
 # Base REST paths of the Traffic Shaper and os-netimpair plugin APIs.
 TS = "/api/trafficshaper"
 NI = "/api/netimpair"
+
+# Pipe bandwidth units (OPNsense ``bandwidthMetric`` values) in bits per second.
+UNITS = {"Kbit": 1_000, "Mbit": 1_000_000, "Gbit": 1_000_000_000}
+# dummynet keeps a pipe's bits/s in 32 bits, so OPNsense rejects anything faster
+# than ~4.29 Gbit/s. LM uses 4 Gbit/s as both the cap and the "no limit" pipe.
+MAX_BPS = 4 * UNITS["Gbit"]
+BANDWIDTH_LIMIT = "OPNsense pipes are limited to 4 Gbit/s"
 
 
 def _error(message: str) -> Dict[str, Any]:
@@ -99,16 +107,60 @@ def validate(spec: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Latency must be between 0 and 10000 ms")
     if not 0 <= loss <= 100:
         raise ValueError("Packet loss must be between 0 and 100 %")
-    # An impairment that neither delays nor drops would do nothing.
-    if delay == 0 and loss == 0:
-        raise ValueError("Set a latency or a packet loss")
+    # Optional bandwidth limit: a whole number in Kbit/Mbit/Gbit per second.
+    bandwidth, unit = _bandwidth(spec)
+    # An impairment that neither delays, drops nor limits would do nothing.
+    if delay == 0 and loss == 0 and bandwidth == 0:
+        raise ValueError("Set a latency, a packet loss or a bandwidth limit")
 
     # Collapse whitespace in the user description and cap its length.
     description = " ".join(str(spec.get("description") or "").split())[:200]
     # Normalised spec; "enabled" accepts the usual false-y strings.
     return {"target": target, "interface": interface, "direction": direction,
-            "delay": delay, "loss": loss, "description": description,
+            "delay": delay, "loss": loss, "bandwidth": bandwidth, "bandwidth_unit": unit,
+            "description": description,
             "enabled": str(spec.get("enabled", "1")) not in ("0", "false", "False")}
+
+
+def _bandwidth(spec: Dict[str, Any]):
+    """``(value, unit)`` of the spec's bandwidth limit, ``(0, "")`` for none.
+    Raises ValueError for a bad value or one above 4 Gbit/s."""
+    raw = str(spec.get("bandwidth") or "").strip()
+    # Blank or 0 means no limit.
+    if raw in ("", "0"):
+        return 0, ""
+    unit = spec.get("bandwidth_unit") or "Mbit"
+    if unit not in UNITS:
+        raise ValueError("Bandwidth unit must be Kbit, Mbit or Gbit")
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError("Bandwidth must be a whole number")
+    if value < 0:
+        raise ValueError("Bandwidth must be a whole number")
+    # Compare in bits/s so 5000 Mbit and 5 Gbit are both refused.
+    if value * UNITS[unit] > MAX_BPS:
+        raise ValueError(f"Bandwidth {value} {unit}/s is too high: {BANDWIDTH_LIMIT}")
+    return value, unit
+
+
+def _pipe_bandwidth(row: Dict[str, Any]):
+    """``(value, unit)`` limit of an LM pipe row, ``(0, "")`` when it does not limit
+    (4 Gbit/s or more, which includes pipes made before the 4 Gbit/s cap), and
+    None when the bandwidth or unit cannot be read (a pipe damaged by hand)."""
+    # Search rows may show the unit by its label ("Mbit/s"); get_* rows by key.
+    label = _selected(row.get("bandwidthMetric")).split("/")[0].lower()
+    unit = next((u for u in UNITS if u.lower() == label), "")
+    try:
+        value = int(row.get("bandwidth"))
+    except (TypeError, ValueError):
+        value = 0
+    # Unreadable: kept apart from "no limit" so the impairment lists as incomplete.
+    if not unit or value <= 0:
+        return None
+    if value * UNITS[unit] >= MAX_BPS:
+        return 0, ""
+    return value, unit
 
 
 def _selected(value) -> str:
@@ -197,9 +249,11 @@ async def _create(engine, iid: str, spec: Dict[str, Any]):
     for way in DIRECTIONS[spec["direction"]]:
         # Tag every object for this direction, keeping the user's description after it.
         description = _tag(iid, way) + (f" {spec['description']}" if spec["description"] else "")
-        # 10 Gbit/s pipe: fast enough that it only delays/drops, never limits bandwidth.
+        # Pipe at the user's limit, or at 4 Gbit/s (the OPNsense maximum) so it
+        # only delays/drops; 10 Gbit/s is refused by OPNsense.
+        bandwidth, unit = (spec["bandwidth"], spec["bandwidth_unit"]) if spec["bandwidth"] else (4, "Gbit")
         pipe_uuid, error = await _add(engine, f"{TS}/settings/add_pipe", {"pipe": {
-            "enabled": "1", "bandwidth": "10", "bandwidthMetric": "Gbit",
+            "enabled": "1", "bandwidth": str(bandwidth), "bandwidthMetric": unit,
             "mask": "none", "scheduler": "", "description": description}})
         # Stop at the first failure; rollback happens after the loop.
         if error:
@@ -266,6 +320,7 @@ async def list_impairments(engine) -> Dict[str, Any]:
         """Return (creating if needed) the summary item for impairment ``iid``."""
         return items.setdefault(iid, {"uuid": iid, "target": "", "interface": "",
                                       "ways": set(), "delay": 0, "loss": 0.0,
+                                      "limits": set(),
                                       "description": "", "enabled": False, "parts": 0})
 
     # Plugin entries hold delay, loss, enabled state and the user description.
@@ -289,9 +344,11 @@ async def list_impairments(engine) -> Dict[str, Any]:
         rule = res.get("rule", {}) if isinstance(res, dict) else {}
         it["interface"] = _selected(rule.get("interface")) or it["interface"]
         it["target"] = (rule.get("source") if way == "up" else rule.get("destination")) or it["target"]
-    # Pipes only count towards completeness.
+    # Pipes hold the bandwidth limit and count towards completeness.
     for row in pipes:
-        item(_parse_tag(row["description"])[0])["parts"] += 1
+        it = item(_parse_tag(row["description"])[0])
+        it["parts"] += 1
+        it["limits"].add(_pipe_bandwidth(row))
 
     # Turn each item into the API shape.
     out = []
@@ -299,8 +356,15 @@ async def list_impairments(engine) -> Dict[str, Any]:
         # Translate the set of directions back to the UI's direction name.
         ways = it.pop("ways")
         it["direction"] = "both" if ways == {"down", "up"} else ("upload" if ways == {"up"} else "download")
+        # LM gives both pipes the same limit; differing pipes (edited by hand)
+        # count as incomplete, like a half-built leftover.
+        # An unreadable pipe (None) also makes it incomplete.
+        limits = it.pop("limits")
+        readable = limits - {None}
+        it["bandwidth"], it["bandwidth_unit"] = min(readable) if readable else (0, "")
         # 3 objects per direction; anything else is a half-built leftover.
-        it["complete"] = it.pop("parts") == 3 * max(len(ways), 1)
+        it["complete"] = (it.pop("parts") == 3 * max(len(ways), 1)
+                          and len(limits) <= 1 and None not in limits)
         out.append(it)
     # Stable order: by target, then id.
     out.sort(key=lambda i: (i["target"], i["uuid"]))

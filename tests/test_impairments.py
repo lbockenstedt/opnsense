@@ -36,6 +36,13 @@ class FakeOpnsense:
         if action.startswith("add"):
             if action == self.fail_on:
                 return {"result": "failed", "validations": {f"{kind}.x": "bad value"}}
+            if kind == "pipe":
+                # OPNsense refuses pipes faster than 2**32-1 bit/s (dummynet limit).
+                pipe = data["pipe"]
+                factor = {"Kbit": 10**3, "Mbit": 10**6, "Gbit": 10**9}.get(pipe["bandwidthMetric"], 1)
+                if int(pipe["bandwidth"]) * factor > 4294967295:
+                    return {"result": "failed", "validations": {
+                        "pipe.bandwidth": "exceeds the maximum bandwidth of 4 Gbit/s."}}
             self.n += 1
             uuid = f"{kind}-{self.n}"
             store[uuid] = dict(data[kind])
@@ -74,7 +81,8 @@ def test_add_both_directions_builds_pipes_rules_and_impairments():
 
     listed = _run(impairments.list_impairments(fw))["data"]
     assert listed == [{"uuid": res["uuid"], "target": "10.0.0.5", "interface": "lan",
-                       "delay": 100, "loss": 2.5, "description": "lab wan sim",
+                       "delay": 100, "loss": 2.5, "bandwidth": 0, "bandwidth_unit": "",
+                       "description": "lab wan sim",
                        "enabled": True, "direction": "both", "complete": True}]
 
 
@@ -123,3 +131,57 @@ def test_missing_plugin_and_bad_input_are_reported():
                 {"loss": 101}, {"direction": "sideways"}):
         assert _run(impairments.add_impairment(FakeOpnsense(), {**SPEC, **bad}))["status"] == "ERROR"
     assert impairments.validate({**SPEC, "target": "10.0.0.9/24"})["target"] == "10.0.0.0/24"
+
+
+def test_unlimited_pipe_is_4_gbit_and_limit_is_checked_in_bits_per_second():
+    # No limit asked for: the pipe runs at 4 Gbit/s, the most OPNsense accepts.
+    fw = FakeOpnsense()
+    assert _run(impairments.add_impairment(fw, SPEC))["status"] == "SUCCESS"
+    assert {(p["bandwidth"], p["bandwidthMetric"]) for p in fw.objects["pipe"].values()} == {("4", "Gbit")}
+
+    # A limit is kept as given and listed back; units are compared in bits/s.
+    fw = FakeOpnsense()
+    res = _run(impairments.add_impairment(fw, {**SPEC, "bandwidth": "4000", "bandwidth_unit": "Mbit"}))
+    assert res["status"] == "SUCCESS"
+    [item] = _run(impairments.list_impairments(fw))["data"]
+    assert (item["bandwidth"], item["bandwidth_unit"]) == (0, "")  # 4000 Mbit/s = no limit
+    fw = FakeOpnsense()
+    _run(impairments.add_impairment(fw, {**SPEC, "bandwidth": "50", "bandwidth_unit": "Mbit"}))
+    [item] = _run(impairments.list_impairments(fw))["data"]
+    assert (item["bandwidth"], item["bandwidth_unit"]) == (50, "Mbit")
+
+    # Over 4 Gbit/s in any unit is refused before anything is created.
+    for value, unit in (("5", "Gbit"), ("4001", "Mbit"), ("4000001", "Kbit")):
+        fw = FakeOpnsense()
+        res = _run(impairments.add_impairment(fw, {**SPEC, "bandwidth": value, "bandwidth_unit": unit}))
+        assert res["status"] == "ERROR" and "limited to 4 Gbit/s" in res["message"]
+        assert not fw.objects["pipe"]
+    for bad in ({"bandwidth": "1.5"}, {"bandwidth": "-1"}, {"bandwidth": "10", "bandwidth_unit": "Tbit"}):
+        assert _run(impairments.add_impairment(FakeOpnsense(), {**SPEC, **bad}))["status"] == "ERROR"
+
+
+def test_bandwidth_only_impairment_and_legacy_10_gbit_pipe_lists_as_unlimited():
+    fw = FakeOpnsense()
+    res = _run(impairments.add_impairment(fw, {**SPEC, "delay": 0, "loss": 0, "bandwidth": "20"}))
+    assert res["status"] == "SUCCESS"
+    # A pipe made before the cap (10 Gbit/s, label form) reads as "no limit".
+    for pipe in fw.objects["pipe"].values():
+        pipe.update(bandwidth="10", bandwidthMetric="Gbit/s")
+    [item] = _run(impairments.list_impairments(fw))["data"]
+    assert (item["bandwidth"], item["bandwidth_unit"], item["complete"]) == (0, "", True)
+
+
+def test_pipes_with_different_limits_list_as_incomplete():
+    fw = FakeOpnsense()
+    _run(impairments.add_impairment(fw, {**SPEC, "bandwidth": "20"}))
+    next(iter(fw.objects["pipe"].values()))["bandwidth"] = "30"
+    [item] = _run(impairments.list_impairments(fw))["data"]
+    assert item["complete"] is False
+
+
+def test_unreadable_pipe_lists_as_incomplete_not_unlimited():
+    fw = FakeOpnsense()
+    _run(impairments.add_impairment(fw, {**SPEC, "target": "192.0.2.5"}))
+    next(iter(fw.objects["pipe"].values())).update(bandwidth="", bandwidthMetric="bit/s")
+    [item] = _run(impairments.list_impairments(fw))["data"]
+    assert (item["bandwidth"], item["complete"]) == (0, False)
