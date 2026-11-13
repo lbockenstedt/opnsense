@@ -427,7 +427,7 @@ class OpnsenseEngine:
         return {"status": "SUCCESS", "data": overview}
 
     async def get_perf_sample(self) -> Dict[str, Any]:
-        """One performance sample for the history charts (``perf_store``).
+        """One performance sample for the history charts (``opn_perf_store``).
 
         Returns ``{"status": "SUCCESS", "data": {"time", "interfaces",
         "metrics"}}``. ``interfaces`` holds the raw byte/packet/error counters
