@@ -732,6 +732,10 @@ class OpnSpoke(BaseSpoke):
             # Impairments: list, add, edit, delete.
             return await impairments.list_impairments(engine)
 
+        elif normalized_cmd == "OPNSENSE_GET_IMPAIRMENT_OPTIONS":
+            # The interfaces a shaper rule accepts (for the form's dropdown).
+            return await impairments.get_impairment_options(engine)
+
         elif normalized_cmd == "OPNSENSE_ADD_IMPAIRMENT":
             return await impairments.add_impairment(engine, data)
 
