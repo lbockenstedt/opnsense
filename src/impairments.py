@@ -761,6 +761,7 @@ async def _prepare(engine, spec: Dict[str, Any]):
     try:
         spec = validate(spec)
         slots = await _slots(engine, spec)
+        await _check_interface(engine, spec["interface"])
     except ValueError as e:
         # Return the validation message to the UI.
         return None, None, _error(str(e))
@@ -768,6 +769,50 @@ async def _prepare(engine, spec: Dict[str, Any]):
     if spec["schedule"] and not spec["schedule"]["start"]:
         spec["schedule"]["start"] = int(time.time())
     return spec, slots, None
+
+
+async def interface_options(engine) -> Optional[List[Dict[str, str]]]:
+    """The interfaces OPNsense accepts on a shaper rule, as
+    ``[{"key": "lan", "description": "LAN"}, ...]``, or None when unreadable.
+
+    ``get_rule`` without a uuid returns a new rule's defaults, with
+    ``interface`` as ``{key: {"value": description, "selected": 0|1}}``: the
+    keys are exactly the values add_rule accepts (assigned, enabled
+    interfaces). Anything else is refused by OPNsense with "Option [] not in
+    list" (its message leaves the value out)."""
+    res = await engine._request("GET", f"{TS}/settings/get_rule")
+    rule = res.get("rule") if isinstance(res, dict) else None
+    field = rule.get("interface") if isinstance(rule, dict) else None
+    if not isinstance(field, dict):
+        logger.warning("impairment interface list unreadable on %s: %s", _host(engine), res)
+        return None
+    out = []
+    for key, option in field.items():
+        if not str(key):
+            continue
+        text = option.get("value") if isinstance(option, dict) else option
+        out.append({"key": str(key), "description": str(text or key)})
+    return out
+
+
+async def _check_interface(engine, interface: str) -> None:
+    """Raise ValueError unless ``interface`` is one the firewall offers for
+    shaper rules, so a bad choice is refused before anything is created."""
+    options = await interface_options(engine)
+    if options is None:
+        raise ValueError("Could not read the firewall's interfaces (trafficshaper get_rule); nothing was changed")
+    if interface not in [o["key"] for o in options]:
+        choices = ", ".join(f"{o['key']} ({o['description']})" for o in options) or "none"
+        raise ValueError(f"Interface '{interface}' is not an enabled interface on this firewall; "
+                         f"choose one of: {choices}")
+
+
+async def get_impairment_options(engine) -> Dict[str, Any]:
+    """OPNSENSE_GET_IMPAIRMENT_OPTIONS: the interfaces the form may offer."""
+    options = await interface_options(engine)
+    if options is None:
+        return _error("Could not read the firewall's interfaces (trafficshaper get_rule)")
+    return {"status": "SUCCESS", "interfaces": options}
 
 
 async def add_impairment(engine, spec: Dict[str, Any], store: ImpairmentStore = None) -> Dict[str, Any]:
