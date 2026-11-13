@@ -113,13 +113,13 @@ def test_tick_marks_sent_only_on_a_confirmed_send_and_keeps_good_counters(tmp_pa
         _run(spoke._perf_sample_tick(start + i * 60))
     assert hub.sent and [r["ts"] for r in spoke.perf_store.unsent()] == [start]
     # A sample with no interface counters keeps the previous counters.
-    good = spoke._perf_prev
+    good = spoke._default.perf_prev
 
     async def no_traffic():
         return {"status": "SUCCESS", "data": {"time": NOW, "interfaces": {}, "metrics": {"cpu": 1}}}
     spoke.engine.get_perf_sample = no_traffic
     _run(spoke._perf_sample_tick(start + 360))
-    assert spoke._perf_prev is good
+    assert spoke._default.perf_prev is good
 
 
 def test_engine_perf_sample_reads_counters_and_gauges():
