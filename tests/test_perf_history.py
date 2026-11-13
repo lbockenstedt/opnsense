@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import asyncio  # noqa: E402
 
 from opn_spoke import OpnSpoke  # noqa: E402
-from perf_store import PerfStore, counter_rates  # noqa: E402
+from opn_perf_store import PerfStore, counter_rates  # noqa: E402
 
 NOW = 1_800_000_000
 
@@ -148,3 +148,19 @@ def test_engine_perf_sample_reads_counters_and_gauges():
     replies.update({k: {"result": "failed"} for k in list(replies)[:2]})
     replies.update({k: {} for k in list(replies)[2:]})
     assert _run(eng.get_perf_sample())["status"] == "ERROR"
+
+
+def test_store_is_opnsense_own_when_another_role_loaded_perf_store_first(monkeypatch):
+    """An agent hosting several roles imports them into one process, so a
+    flat module name another role loaded first (truenas had a perf_store)
+    would be reused and firewall averages written to that role's file."""
+    import importlib
+    import types
+    other = types.ModuleType("perf_store")
+    other.PerfStore = other.PerfAverager = type("OtherRoleStore", (), {})
+    other.counter_rates = lambda prev, cur: {}
+    monkeypatch.setitem(sys.modules, "perf_store", other)
+    monkeypatch.delitem(sys.modules, "opn_spoke", raising=False)
+    spoke_module = importlib.import_module("opn_spoke")
+    assert spoke_module.PerfStore.__module__ == "opn_perf_store"
+    assert spoke_module.PerfAverager.__module__ == "opn_perf_store"

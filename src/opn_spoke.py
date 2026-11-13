@@ -11,7 +11,7 @@ import time
 from typing import Dict, Any
 from core.src.base_spoke import BaseSpoke
 from opnsense_engine import OpnsenseEngine
-from perf_store import PerfAverager, PerfStore, counter_rates
+from opn_perf_store import PerfAverager, PerfStore, counter_rates
 import impairments
 
 # Module logger.
