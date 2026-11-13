@@ -128,7 +128,8 @@ schedule is gone (lost file). If switching fails, the spoke switches every
 rule of that impairment off, stores the error (shown in the list) and retries
 on the next pass; a failed shaper reload is repeated every pass until it
 works, since a toggled rule only takes effect after a reload. A stored
-schedule whose rules are gone is dropped. Targets
+schedule whose rules are gone is dropped the next time the spoke reads the
+rules (each window boundary, and after a restart). Targets
 or a schedule that cannot be saved (except plain always-on addresses, which
 need nothing stored) make the add or edit fail with nothing changed. A spoke that is stopped cannot switch anything: an impairment that
 was on stays on until the spoke runs again.

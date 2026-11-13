@@ -397,6 +397,51 @@ def test_failed_shaper_reload_is_retried_until_it_works(_store):
     assert len(fw.calls) == calls
 
 
+def test_partial_switch_failure_still_reloads_what_was_switched(_store):
+    """Rotation, one direction: the old target's rule goes off, the new one's
+    toggle fails. The fail-safe finds every rule already off in the config,
+    but the running shaper still impairs the old target until a reload."""
+    import time
+    sched = {"every_hours": 1, "for_minutes": 30, "start": int(time.time() - 60)}
+    fw = FakeOpnsense()
+    _run(impairments.add_impairment(fw, {**SPEC, "direction": "download", "schedule": sched,
+                                         "targets": ["192.0.2.5", "192.0.2.6"]}))
+    state = {}
+    _run(impairments.run_schedules(fw, state, sched["start"] + 60))
+    real = fw._request
+
+    async def refuse_on(method, endpoint, data=None):
+        if "/toggle_rule/" in endpoint and endpoint.endswith("/1"):
+            return {"result": "failed"}
+        return await real(method, endpoint, data)
+    fw._request = refuse_on
+    reloads = fw.applied.count("trafficshaper")
+    _run(impairments.run_schedules(fw, state, sched["start"] + 3600 + 60))
+    assert {r["enabled"] for r in fw.objects["rule"].values()} == {"0"}
+    assert fw.applied.count("trafficshaper") == reloads + 1
+    [item] = _run(impairments.list_impairments(fw))["data"]
+    assert "toggle_rule" in item["error"]
+
+
+def test_schedule_whose_rules_are_gone_is_forgotten_when_rules_are_read(_store):
+    """A leftover schedule that stays off is never due; it must still go the
+    next time the rules are read (here: another impairment's boundary)."""
+    import time
+    now = int(time.time())
+    fw = FakeOpnsense()
+    later = {"every_hours": 1, "for_minutes": 30, "start": now + 7200}
+    soon = {"every_hours": 1, "for_minutes": 30, "start": now + 600}
+    _run(impairments.add_impairment(fw, {**SPEC, "schedule": later, "targets": ["192.0.2.5"]}))
+    [gone] = _store.all("?")
+    _run(impairments.add_impairment(fw, {**SPEC, "schedule": soon, "targets": ["192.0.2.6"]}))
+    state = {}
+    _run(impairments.run_schedules(fw, state, now))
+    for uuid in [u for u, r in fw.objects["rule"].items() if gone in r["description"]]:
+        del fw.objects["rule"][uuid]
+    _run(impairments.run_schedules(fw, state, now + 660))
+    assert gone not in _store.all("?") and len(_store.all("?")) == 1
+
+
 def test_next_target_during_a_window_is_the_following_one(_store):
     import time
     sched = {"every_hours": 1, "for_minutes": 30, "start": int(time.time() - 60)}

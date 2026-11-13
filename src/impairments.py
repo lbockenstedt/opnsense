@@ -886,9 +886,11 @@ async def _toggle_rules(engine, rows, want, state: Dict[str, Any]) -> Optional[s
         expected = "Enabled" if target == "1" else "Disabled"
         if not (isinstance(res, dict) and res.get("result") == expected):
             return f"toggle_rule {row['uuid']} failed: {res}"
-        # Keep the row current, so a fail-safe pass over the same rows sees it on.
+        # Keep the row current, so a fail-safe pass over the same rows sees it on,
+        # and mark the shaper stale at once: if a later toggle fails, the
+        # fail-safe pass must still reload what this one changed.
         row["enabled"] = target
-        changed = True
+        state["dirty"] = changed = True
     if changed:
         res = await engine._request("POST", f"{TS}/service/reconfigure", data={})
         state["dirty"] = not (isinstance(res, dict) and res.get("status") == "ok")
@@ -909,7 +911,8 @@ async def run_schedules(engine, state: Dict[str, Any], now: float,
     is gone. Only rules that differ are toggled; a pass with nothing due makes
     no API call. A failed shaper reload is retried on every pass until it
     works (``dirty``). A stored impairment whose rules are gone (deleted, or
-    a leftover) is dropped from the store.
+    a leftover) is dropped from the store whenever the rules are read (each
+    window boundary, and the first pass after a restart).
 
     Fail-safe: when switching fails, every rule of that impairment is switched
     off (best effort) and the error is stored for the list to show; the next
@@ -945,14 +948,18 @@ async def run_schedules(engine, state: Dict[str, Any], now: float,
             logger.warning("impairment scheduler on %s: could not switch off unscheduled rules: %s", host, error)
         else:
             state["swept"] = True
+    # A stored schedule with nothing on the firewall is a deleted impairment's
+    # leftover: forget it whenever the rules are read, due or not.
+    for iid in list(metas):
+        if not any(_parse_tag(r["description"])[0] == iid for r in ours):
+            logger.warning("impairment %s on %s has no shaper rules; forgetting its schedule", iid, host)
+            await asyncio.to_thread(store.put, host, iid, None)
+            applied.pop(iid, None)
+            if iid in due:
+                due.remove(iid)
     for iid in due:
         mine = [r for r in ours if _parse_tag(r["description"])[0] == iid]
         slot = wanted[iid]
-        if not mine:
-            # Nothing on the firewall to switch: a deleted impairment's leftover.
-            logger.warning("impairment %s on %s has no shaper rules; forgetting its schedule", iid, host)
-            await asyncio.to_thread(store.put, host, iid, None)
-            continue
         error = await _toggle_rules(engine, mine, lambda r, slot=slot: "1" if _rule_slot(r["description"]) == slot else "0", state)
         if error:
             # Fail safe: switch the whole impairment off and report it.
