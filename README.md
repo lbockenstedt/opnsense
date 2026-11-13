@@ -48,7 +48,7 @@ The spoke dials the Lab Manager Hub over an outbound TLS WebSocket connection (`
 ### Key Architectural Patterns
 
 - **`src/opn_spoke.py` (`OpnSpoke`)**: Core command router, in-memory TTL caching layer, sensitive credential masking, and background refresh scheduler (`_cache_refresh_loop`).
-- **`src/perf_store.py`**: Performance history. Every minute the spoke samples interface counters, CPU, memory and pf states; counters become rates (a counter reset skips one interval), averaged into 5-minute buckets and kept 7 days as JSON. Standard library only.
+- **`src/opn_perf_store.py`**: Performance history. Every minute the spoke samples interface counters, CPU, memory and pf states; counters become rates (a counter reset skips one interval), averaged into 5-minute buckets and kept 7 days as JSON. Standard library only.
 - **`src/opnsense_engine.py` (`OpnsenseEngine`)**: REST API abstraction interacting with OPNsense endpoints using system `curl` to ensure robust TLS handshake and header negotiation.
 - **In-Memory Cache & Startup Priming**: Read-heavy endpoints (interface status, system health, rules, aliases, NAT, DNS, stats, ARP) are cached with a configurable TTL (default 60s) and refreshed via a periodic 1-hour background sweep. The cache is automatically primed on startup to eliminate cold-cache latency.
 - **Live Volatile Reads**: Dynamic DHCP leases (`OPNSENSE_GET_DHCP_LEASES`) deliberately bypass the cache and query Kea DHCP live on every call to prevent serving stale lease states.
@@ -85,7 +85,7 @@ The spoke dials the Lab Manager Hub over an outbound TLS WebSocket connection (`
 | `GET_INTERFACE_STATUS` | `get_interface_status` | Returns normalized link state, IP, MAC, MTU, and flags for all interfaces. |
 | `GET_SYSTEM_HEALTH` | `get_system_health` | Queries firewall CPU, memory, and runtime diagnostics. |
 | `OPNSENSE_GET_FIREWALL_STATS` | `get_firewall_stats` | Fetches packet counters, byte rates, and filter diagnostic statistics. |
-| `OPNSENSE_GET_PERF_HISTORY` | `perf_store.PerfStore.history` | 5-minute performance averages (throughput, packets, errors, CPU, memory, pf states) for a start/end range; the spoke keeps 7 days in `$LM_OPNSENSE_DATA_DIR/perf.json` and pushes each new average to the hub as `STORAGE_PERF_SAMPLE`. |
+| `OPNSENSE_GET_PERF_HISTORY` | `opn_perf_store.PerfStore.history` | 5-minute performance averages (throughput, packets, errors, CPU, memory, pf states) for a start/end range; the spoke keeps 7 days in `$LM_OPNSENSE_DATA_DIR/perf.json` and pushes each new average to the hub as `STORAGE_PERF_SAMPLE`. |
 | `OPNSENSE_GET_ALL_RULES` | `get_all_firewall_rules` | Lists all configured firewall filter rules across interfaces. |
 | `OPNSENSE_GET_RULES_BY_IP` | `get_rules_for_ip` | Filters firewall rules matching a specific source or destination IP. |
 | `OPNSENSE_ADD_RULE` | `add_firewall_rule_and_apply` | Adds a new firewall rule and applies changes immediately. |
