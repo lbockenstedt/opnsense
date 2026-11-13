@@ -182,8 +182,33 @@ class OpnSpoke(BaseSpoke):
         control plane and by the generic agent's role hook."""
         if self._bg_tasks:
             return
-        self._bg_tasks = [asyncio.create_task(self._perf_sample_loop())]
-        logger.info("opnsense performance sampling loop started")
+        self._bg_tasks = [asyncio.create_task(self._perf_sample_loop()),
+                          asyncio.create_task(self._impair_schedule_loop())]
+        logger.info("opnsense performance sampling and impairment schedule loops started")
+
+    # Scheduled impairments are checked this often, so a window opens or
+    # closes at most this late.
+    _IMPAIR_TICK_S = 30
+
+    async def _impair_schedule_loop(self):
+        """Switch scheduled impairments on and off at their window boundaries.
+        The per-firewall state lives in memory only: after a restart the first
+        pass re-checks every scheduled impairment against its schedule."""
+        state: Dict[str, Dict[str, Any]] = {}
+        while True:
+            await self._impair_schedule_tick(state, time.time())
+            await asyncio.sleep(self._IMPAIR_TICK_S)
+
+    async def _impair_schedule_tick(self, state, now: float):
+        """One scheduler pass over every configured firewall; one firewall's
+        error never stops the others."""
+        for fw in self._all_targets():
+            if not fw.engine.is_configured():
+                continue
+            try:
+                await impairments.run_schedules(fw.engine, state.setdefault(fw.engine.host, {}), now)
+            except Exception as e:  # noqa: BLE001 - loop must never die
+                logger.warning("impairment schedule pass on %s failed: %s", fw.engine.host, e)
 
     async def _perf_sample_loop(self):
         """Sample the firewall every minute and push 5-minute averages."""
@@ -700,8 +725,9 @@ class OpnSpoke(BaseSpoke):
                 data.get("description", "")
             ), ["OPNSENSE_GET_DNS_RECORDS"])
 
-        # Network impairments (latency / loss per host or subnet, os-netimpair
-        # plugin). Few objects and always read live, so not cached.
+        # Network impairments (latency / loss / bandwidth for addresses, aliases
+        # or devices, always on or scheduled; os-netimpair plugin). Few objects
+        # and always read live, so not cached.
         elif normalized_cmd == "OPNSENSE_GET_IMPAIRMENTS":
             # Impairments: list, add, edit, delete.
             return await impairments.list_impairments(engine)

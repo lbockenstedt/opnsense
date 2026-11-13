@@ -84,21 +84,64 @@ the command never falls back to another firewall.
   - **Payload**: `{}`
   - **Response**: `{"status": "SUCCESS", "data": [...]}`
 
-### Network Impairment (latency / packet loss)
+### Network Impairment (latency / packet loss / bandwidth, always on or scheduled)
 Needs the `os-netimpair` plugin on the firewall (see `plugin/netimpair`) and an
 API key with the *Firewall: Shaper* and *Firewall: Shaper: Impairment*
 privileges. Each impairment is a Traffic Shaper pipe + rule per direction plus a
 netimpair entry, all tagged `lm-impair:<id>:<down|up>` in their description
 (`src/impairments.py`). Without the plugin every command returns an ERROR
-saying so.
+saying so. OPNsense refuses pipes faster than 4 Gbit/s (dummynet keeps bits/s in
+32 bits), so a pipe without a bandwidth limit is created at 4 Gbit/s and a
+limit above 4 Gbit/s (compared in bits/s, whatever the unit) is rejected with
+"OPNsense pipes are limited to 4 Gbit/s".
+
+**Targets.** `target_type` says what `targets` (an ordered list, at most 32)
+holds:
+- `ip`: addresses or subnets (`192.0.2.5`, `198.51.100.0/24`);
+- `device`: the address of an LM device, picked by name in the hub UI, which
+  sends the name in `labels` (one per target) for display;
+- `alias`: OPNsense alias names. Shaper rules only take addresses
+  (`NetworkField`), not alias names, so the spoke reads the alias list and
+  writes each alias's member addresses into the rule (nested aliases are
+  followed). An unknown alias, an empty one, or one with a member that is not
+  an address (hostname, URL table, port) is refused. The members are copied
+  when the impairment is saved: after changing the alias, save the
+  impairment again. `alias_members: true` (with exactly one alias) makes each
+  member its own target (at most 32 members, like a list of targets).
+
+An older hub sends a single `target` instead; it is treated as `targets` of
+one address. Each target gets its own shaper rule per direction.
+
+**Schedule.** `schedule: {"every_hours": 1-720, "for_minutes": 1 to
+every_hours*60-1, "start": epoch seconds (0 or missing = when saved)}` turns
+the impairment on for `for_minutes` every `every_hours` from `start`;
+`null` means always on. Window *k* (counted from `start`) impairs target
+`k % len(targets)`, so a list of targets rotates one per window; a single
+target is a list of one. Without a schedule every target is impaired at once.
+The spoke keeps targets and schedules in `$LM_OPNSENSE_DATA_DIR/impairments.json`
+(per firewall) and checks them every 30 s: it enables only the current
+window's rules, disables them all outside a window, and applies
+(`trafficshaper/service/reconfigure`) only when a rule changed. The answer is
+worked out from the clock, so a restarted spoke puts the right rule on (or
+all off) on its first pass, and switches off any scheduled rule whose
+schedule is gone (lost file). If switching fails, the spoke switches every
+rule of that impairment off, stores the error (shown in the list) and retries
+on the next pass; a failed shaper reload is repeated every pass until it
+works, since a toggled rule only takes effect after a reload. A stored
+schedule whose rules are gone is dropped the next time the spoke reads the
+rules (each window boundary, and after a restart). Targets
+or a schedule that cannot be saved (except plain always-on addresses, which
+need nothing stored) make the add or edit fail with nothing changed. A spoke that is stopped cannot switch anything: an impairment that
+was on stays on until the spoke runs again.
+
 - **`OPNSENSE_GET_IMPAIRMENTS`**
   - **Payload**: `{}`
-  - **Response**: `{"status": "SUCCESS", "data": [{"uuid", "target", "interface", "direction", "delay", "loss", "description", "enabled", "complete"}]}`
+  - **Response**: `{"status": "SUCCESS", "data": [{"uuid", "target", "target_type", "targets", "labels", "alias_members", "interface", "direction", "delay", "loss", "bandwidth", "bandwidth_unit", "description", "enabled", "complete", "active", "active_target", "schedule", "next_on", "next_off", "next_target", "error", "error_at"}]}`. `target` is the display text (labels or targets, comma-separated); `bandwidth` 0 means no limit; `active` is true while a rule is impairing, `active_target` names which; `next_on`/`next_off` (epoch seconds) and `next_target` come from the schedule (null when always on or disabled); `error` is the scheduler's last failure ("" when fine).
 - **`OPNSENSE_ADD_IMPAIRMENT`**
-  - **Payload**: `{"target": "10.0.0.5" | "10.0.0.0/24", "interface": "lan", "direction": "both|download|upload", "delay": ms (0-10000), "loss": % (0-100), "description": "", "enabled": "1"}`
+  - **Payload**: `{"target_type": "ip|alias|device", "targets": [...], "labels": [...], "alias_members": false, "schedule": null | {...}, "interface": "lan", "direction": "both|download|upload", "delay": ms (0-10000), "loss": % (0-100), "bandwidth": optional whole number (blank/0 = no limit), "bandwidth_unit": "Kbit|Mbit|Gbit" (default Mbit, at most 4 Gbit/s in total), "description": "", "enabled": "1"}`. At least one of delay, loss or bandwidth must be set. `enabled: "0"` keeps a scheduled impairment off.
   - **Response**: `{"status": "SUCCESS", "uuid": "<id>"}`. A failed step deletes what was already created.
 - **`OPNSENSE_EDIT_IMPAIRMENT`**
-  - **Payload**: the add payload plus `"uuid"`. The new version is built before the old one is removed, so a failed edit keeps the original; the response carries the new `uuid`.
+  - **Payload**: the add payload plus `"uuid"`. The new version is built before the old one is removed, so a failed edit keeps the original; the response carries the new `uuid`. Turning an impairment on or off is an edit with `enabled` changed.
 - **`OPNSENSE_DEL_IMPAIRMENT`**
   - **Payload**: `{"uuid": "<id>"}`
 
