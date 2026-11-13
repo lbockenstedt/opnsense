@@ -24,8 +24,10 @@ def _store(tmp_path, monkeypatch):
 
 
 class FakeOpnsense:
-    def __init__(self, plugin=True, fail_on=None, aliases=None):
+    def __init__(self, plugin=True, fail_on=None, aliases=None, interfaces=None):
         self.plugin = plugin
+        # Assigned, enabled interfaces: what OPNsense offers on a shaper rule.
+        self.interfaces = interfaces or {"lan": "LAN", "opt1": "OPT1"}
         self.fail_on = fail_on
         self.aliases = aliases or []
         self.objects = {"pipe": {}, "rule": {}, "impairment": {}}
@@ -59,6 +61,9 @@ class FakeOpnsense:
         if action.startswith("add"):
             if action == self.fail_on:
                 return {"result": "failed", "validations": {f"{kind}.x": "bad value"}}
+            if kind == "rule" and data["rule"]["interface"] not in self.interfaces:
+                # OPNsense's InterfaceField message leaves the value out.
+                return {"result": "failed", "validations": {"rule.interface": "Option [] not in list."}}
             if kind == "pipe":
                 # OPNsense refuses pipes faster than 2**32-1 bit/s (dummynet limit).
                 pipe = data["pipe"]
@@ -74,9 +79,10 @@ class FakeOpnsense:
             store.pop(parts[4], None)
             return {"result": "deleted"}
         if action == "get_rule":
-            rule = dict(store[parts[4]])
-            rule["interface"] = {"lan": {"value": "LAN", "selected": 1 if rule["interface"] == "lan" else 0},
-                                 "opt1": {"value": "OPT1", "selected": 1 if rule["interface"] == "opt1" else 0}}
+            # Without a uuid: a new rule's defaults (the option list itself).
+            rule = dict(store[parts[4]]) if len(parts) > 4 else {"interface": "wan"}
+            rule["interface"] = {k: {"value": v, "selected": 1 if rule["interface"] == k else 0}
+                                 for k, v in self.interfaces.items()}
             return {"rule": rule}
         raise AssertionError(endpoint)
 
@@ -498,3 +504,51 @@ def test_completeness_counts_each_object_per_direction():
     fw.objects["pipe"]["pipe-extra"] = pipe
     [item] = _run(impairments.list_impairments(fw))["data"]
     assert item["complete"] is False
+
+
+def test_interface_options_come_from_a_new_rule_template():
+    fw = FakeOpnsense(interfaces={"wan": "WAN", "opt2": "Lab net"})
+    res = _run(impairments.get_impairment_options(fw))
+    assert res == {"status": "SUCCESS", "interfaces": [
+        {"key": "wan", "description": "WAN"}, {"key": "opt2", "description": "Lab net"}]}
+    assert fw.calls == ["/api/trafficshaper/settings/get_rule"]
+
+
+def test_interface_options_unreadable_is_an_error():
+    fw = FakeOpnsense()
+
+    async def broken(method, endpoint, data=None):
+        return {"errorMessage": "Endpoint not found"}
+    fw._request = broken
+    assert _run(impairments.get_impairment_options(fw))["status"] == "ERROR"
+    res = _run(impairments.add_impairment(fw, SPEC))
+    assert res["status"] == "ERROR" and "interfaces" in res["message"]
+
+
+def test_interface_not_on_the_firewall_is_refused_before_any_write():
+    """Regression: the form's free-text interface defaulted to "lan". On a
+    firewall without an enabled "lan", OPNsense refused the rule with
+    "rule.interface: Option [] not in list." after the pipe was made."""
+    fw = FakeOpnsense(interfaces={"wan": "WAN", "opt2": "Lab net"})
+    for bad in ("lan", "LAN", "vtnet1"):
+        res = _run(impairments.add_impairment(fw, {**SPEC, "interface": bad}))
+        assert res["status"] == "ERROR"
+        assert f"Interface '{bad}' is not an enabled interface" in res["message"]
+        assert "opt2 (Lab net)" in res["message"] and "Option []" not in res["message"]
+    assert not any("/add_" in c or "/del_" in c for c in fw.calls)
+    assert fw.objects == {"pipe": {}, "rule": {}, "impairment": {}}
+    # Edit is refused the same way, before the replacement is built.
+    ok = _run(impairments.add_impairment(fw, {**SPEC, "interface": "opt2"}))
+    assert ok["status"] == "SUCCESS"
+    before = {k: dict(v) for k, v in fw.objects.items()}
+    res = _run(impairments.edit_impairment(fw, ok["uuid"], {**SPEC, "interface": "lan"}))
+    assert res["status"] == "ERROR" and fw.objects == before
+
+
+def test_rule_body_carries_the_interface_key():
+    fw = FakeOpnsense(interfaces={"opt2": "Lab net"})
+    res = _run(impairments.add_impairment(fw, {**SPEC, "interface": " opt2 "}))
+    assert res["status"] == "SUCCESS"
+    assert {r["interface"] for r in fw.objects["rule"].values()} == {"opt2"}
+    [item] = _run(impairments.list_impairments(fw))["data"]
+    assert item["interface"] == "opt2"
