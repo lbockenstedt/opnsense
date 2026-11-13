@@ -14,12 +14,23 @@ stored on the LM side.
 """
 # ipaddress validates and normalises the target host/subnet.
 import ipaddress
+# logging records why a change failed (the spoke logs commands only at DEBUG).
+import logging
 # re checks that the interface name is a plain OPNsense identifier.
 import re
 # uuid generates short random ids for new impairments.
 import uuid as uuidlib
 # Type hints for spec/result dictionaries.
 from typing import Any, Dict, List
+
+# Module logger.
+logger = logging.getLogger("OpnSpoke.impairments")
+
+
+def _host(engine) -> str:
+    """The firewall address for log lines ("?" when the engine has none)."""
+    return getattr(engine, "host", None) or "?"
+
 
 # Prefix written into every description so LM can find its own objects later.
 TAG = "lm-impair"
@@ -119,6 +130,7 @@ async def _rows(engine, endpoint: str):
     if isinstance(res, dict) and isinstance(res.get("rows"), list):
         return res["rows"]
     # Error or unexpected answer (e.g. endpoint missing).
+    logger.warning("impairment read failed at %s on %s: %s", endpoint, _host(engine), res)
     return None
 
 
@@ -146,6 +158,7 @@ async def _apply(engine) -> Dict[str, Any]:
         res = await engine._request("POST", endpoint, data={})
         # Anything other than {"status": "ok"} means the change was not applied.
         if not (isinstance(res, dict) and res.get("status") == "ok"):
+            logger.warning("impairment apply failed at %s on %s: %s", endpoint, _host(engine), res)
             return _error(f"Apply failed at {endpoint}: {res}")
     # Both services reloaded.
     return {"status": "SUCCESS"}
@@ -157,11 +170,20 @@ async def _add(engine, endpoint: str, body: Dict[str, Any]):
     # OPNsense signals success with result "saved" plus the new object's uuid.
     if isinstance(res, dict) and res.get("result") == "saved" and res.get("uuid"):
         return res["uuid"], None
+    # Log the endpoint and the full reply; the UI only gets the message.
+    logger.warning("impairment add failed at %s on %s: %s", endpoint, _host(engine), res)
     # Field validation errors: join them into one readable message.
     if isinstance(res, dict) and res.get("validations"):
         return None, "; ".join(f"{k}: {v}" for k, v in res["validations"].items())
     # Any other failure: use the API's message, or the raw response.
     return None, (res.get("message") if isinstance(res, dict) else None) or str(res)
+
+
+async def _delete(engine, endpoint: str) -> None:
+    """POST a del_* call; log it when OPNsense does not confirm the delete."""
+    res = await engine._request("POST", endpoint, data={})
+    if not (isinstance(res, dict) and res.get("result") == "deleted"):
+        logger.warning("impairment delete failed at %s on %s: %s", endpoint, _host(engine), res)
 
 
 async def _create(engine, iid: str, spec: Dict[str, Any]):
@@ -207,8 +229,10 @@ async def _create(engine, iid: str, spec: Dict[str, Any]):
         created.append(f"{NI}/settings/del_impairment/{imp_uuid}")
     # Roll back: delete created objects in reverse order (dependents before pipes).
     if error:
+        logger.warning("impairment %s on %s failed (%s); rolling back %d object(s)",
+                       iid, _host(engine), error, len(created))
         for endpoint in reversed(created):
-            await engine._request("POST", endpoint, data={})
+            await _delete(engine, endpoint)
     # None on success, otherwise the first error message.
     return error
 
@@ -221,11 +245,11 @@ async def _remove(engine, iid: str, tagged) -> None:
     mine = lambda rows: [r["uuid"] for r in rows if _parse_tag(r.get("description", ""))[0] == iid]
     # Delete in dependency order: impairments, then rules, then pipes.
     for uuid in mine(impairments):
-        await engine._request("POST", f"{NI}/settings/del_impairment/{uuid}", data={})
+        await _delete(engine, f"{NI}/settings/del_impairment/{uuid}")
     for uuid in mine(rules):
-        await engine._request("POST", f"{TS}/settings/del_rule/{uuid}", data={})
+        await _delete(engine, f"{TS}/settings/del_rule/{uuid}")
     for uuid in mine(pipes):
-        await engine._request("POST", f"{TS}/settings/del_pipe/{uuid}", data={})
+        await _delete(engine, f"{TS}/settings/del_pipe/{uuid}")
 
 
 async def list_impairments(engine) -> Dict[str, Any]:
@@ -307,6 +331,8 @@ async def add_impairment(engine, spec: Dict[str, Any]) -> Dict[str, Any]:
     if applied["status"] != "SUCCESS":
         return applied
     # Report success with the new id.
+    logger.info("impairment %s added on %s: %s %s, %s ms, %s %% loss", iid, _host(engine),
+                spec["target"], spec["direction"], spec["delay"], spec["loss"])
     return {"status": "SUCCESS", "message": f"Impairment added for {spec['target']}", "uuid": iid}
 
 
@@ -330,6 +356,7 @@ async def edit_impairment(engine, iid: str, spec: Dict[str, Any]) -> Dict[str, A
     new_id = uuidlib.uuid4().hex[:12]
     error = await _create(engine, new_id, spec)
     if error:
+        logger.warning("impairment %s edit on %s failed: %s", iid, _host(engine), error)
         return _error(f"Could not update the impairment: {error}")
     # Replacement exists: now remove the old objects and apply.
     await _remove(engine, iid, tagged)
@@ -337,6 +364,7 @@ async def edit_impairment(engine, iid: str, spec: Dict[str, Any]) -> Dict[str, A
     if applied["status"] != "SUCCESS":
         return applied
     # Report success with the replacement's new id.
+    logger.info("impairment %s on %s replaced by %s", iid, _host(engine), new_id)
     return {"status": "SUCCESS", "message": f"Impairment updated for {spec['target']}", "uuid": new_id}
 
 
@@ -354,4 +382,5 @@ async def delete_impairment(engine, iid: str) -> Dict[str, Any]:
     applied = await _apply(engine)
     if applied["status"] != "SUCCESS":
         return applied
+    logger.info("impairment %s deleted on %s", iid, _host(engine))
     return {"status": "SUCCESS", "message": f"Impairment {iid} deleted"}
