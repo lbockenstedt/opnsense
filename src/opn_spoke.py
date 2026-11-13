@@ -35,6 +35,59 @@ _SYSTEM_COMMANDS = frozenset({
 })
 
 
+class FirewallTarget:
+    """One firewall this spoke manages: its API client, its read cache and its
+    last performance counters.
+
+    The hub can bind several firewalls (e.g. both boxes of an HA pair) to one
+    spoke and names the one a command is for with ``firewall_id``. Each gets
+    its own target, so one box's data is never served for, or written to,
+    another (before this every command went to the first firewall)."""
+
+    def __init__(self, fw_id, engine: OpnsenseEngine, cache_ttl):
+        """Wrap ``engine`` for the hub firewall ``fw_id`` with an empty cache."""
+        self.id = fw_id
+        self.engine = engine
+        self.cache_ttl = cache_ttl
+        # Cached read responses and the time each was stored.
+        self.cache = {}
+        self.cache_ts = {}
+        # Previous counter sample, for per-second rates.
+        self.perf_prev = None
+
+    def get_fresh(self, key: str):
+        """The cached value for ``key`` if younger than ``cache_ttl``, else None
+        (the caller fetches live). Bounds how stale a read can be."""
+        if key in self.cache and (time.time() - self.cache_ts.get(key, 0)) < self.cache_ttl:
+            return self.cache[key]
+        return None
+
+    def store(self, key: str, res: Dict[str, Any]) -> Dict[str, Any]:
+        """Cache a successful read result; return ``res`` unchanged."""
+        if isinstance(res, dict) and res.get("status") == "SUCCESS":
+            self.cache[key] = res
+            self.cache_ts[key] = time.time()
+        return res
+
+    def invalidate(self, res: Dict[str, Any], keys) -> Dict[str, Any]:
+        """After a successful write, drop the cached reads it changes so the
+        next read is live. Returns ``res`` unchanged."""
+        if isinstance(res, dict) and res.get("status") == "SUCCESS":
+            for k in keys:
+                self.cache.pop(k, None)
+                self.cache_ts.pop(k, None)
+        return res
+
+
+def _engine_for(fw: Dict[str, Any]) -> OpnsenseEngine:
+    """API client for a hub firewall record (``host``/``port`` or the
+    ``opn_*`` names). No host means unconfigured — never a localhost default."""
+    host = fw.get("opn_host") or fw.get("host")
+    port = fw.get("opn_port") or fw.get("port") or 8443
+    return OpnsenseEngine(host=f"{host}:{port}" if host else None,
+                          api_key=fw.get("api_key"), api_secret=fw.get("api_secret"))
+
+
 class OpnSpoke(BaseSpoke):
     """
     OPNsense Management Spoke for Lab Manager.
@@ -49,45 +102,63 @@ class OpnSpoke(BaseSpoke):
         # api_secret through UPDATE_CONFIG). Until a host is configured the
         # engine is UNCONFIGURED and every API call short-circuits with
         # "no firewall configured" instead of connecting to localhost:8443.
-        """Build the engine from config, set up the cache, then start the base spoke."""
-        # Host and port from config; no host means unconfigured.
-        host = config.get("opn_host") or config.get("host")
-        port = config.get("opn_port") or config.get("port")
-        combined_host = f"{host}:{port or 8443}" if host else None
-
-        # The OPNsense API client.
-        self.engine = OpnsenseEngine(
-            host=combined_host,
-            api_key=config.get("api_key"),
-            api_secret=config.get("api_secret")
-        )
-
-        # Caching and Scheduling
-        # Cached responses.
-        self._cache = {}
-        # Per-key store timestamp (epoch seconds) for TTL-bounded reads. The
-        # persistent read-cache is refreshed by the 1h loop AND filled by every
-        # live read (_cache_live); without a TTL, handle_command served whatever
-        # was last stored — up to 1h stale after an add/delete. Reads are now
-        # capped at _cache_ttl (like DHCP leases, which are served live) and
-        # write handlers pop the affected GET keys for immediate freshness.
-        # Per-key timestamps, read TTL and refresh interval.
-        self._cache_ts = {}
+        """Build the firewall targets from config, then start the base spoke."""
+        # Read cache: filled by the 1h refresh loop and by every live read.
+        # Reads are capped at _cache_ttl so a write is visible right away
+        # (write handlers also drop the reads they change).
         self._cache_ttl = config.get("cache_ttl", 60)  # seconds; cap read staleness
+        # The default firewall (the top-level config fields): what a command
+        # with no ``firewall_id`` (an older hub, or a spoke-wide read) talks to.
+        self.engine = _engine_for(config)
+        self._default = FirewallTarget(config.get("id"), self.engine, self._cache_ttl)
+        # The other firewalls bound to this spoke, by hub firewall id.
+        self._targets: Dict[str, FirewallTarget] = {}
+        self._set_firewalls(config.get("firewalls"))
+
+        # Refresh scheduling.
         self._refresh_interval = config.get("refresh_interval", 3600) # seconds, default 1h
         self._refresh_task = None
 
         # Performance history: the hub link (set by the control plane), the
-        # 5-minute averager, the 7-day store and the last counter sample.
+        # 5-minute averager and the 7-day store.
         self.control_plane = None
         self.perf = PerfAverager()
         self.perf_store = PerfStore()
-        self._perf_prev = None
         self._bg_tasks = []
 
         # Start the base spoke, then the refresh loop.
         super().__init__(spoke_id, config)
         self._start_refresh_loop()
+
+    def _all_targets(self):
+        """The default firewall followed by the others."""
+        return [self._default, *self._targets.values()]
+
+    def _set_firewalls(self, firewalls) -> None:
+        """Build a target for every firewall the hub bound to this spoke other
+        than the default one. A target whose address and credentials did not
+        change keeps its cache."""
+        targets = {}
+        for fw in firewalls or []:
+            # Skip malformed entries and the default firewall (handled by UPDATE_CONFIG).
+            if not isinstance(fw, dict) or not fw.get("id") or fw["id"] == self._default.id:
+                continue
+            engine = _engine_for(fw)
+            old = self._targets.get(fw["id"])
+            same = old and ((old.engine.host, old.engine.api_key, old.engine.api_secret)
+                            == (engine.host, engine.api_key, engine.api_secret))
+            targets[fw["id"]] = old if same else FirewallTarget(fw["id"], engine, self._cache_ttl)
+        self._targets = targets
+
+    def _target_for(self, data) -> "FirewallTarget | None":
+        """The firewall a command is for: ``data["firewall_id"]`` when the hub
+        names one, else the default firewall (older hubs send no id). None for
+        an id this spoke does not manage, so the command fails instead of
+        silently running on another box."""
+        fw_id = data.get("firewall_id") if isinstance(data, dict) else None
+        if not fw_id or fw_id == self._default.id:
+            return self._default
+        return self._targets.get(fw_id)
 
     def _start_refresh_loop(self):
         """Starts the background cache refresh task."""
@@ -126,20 +197,21 @@ class OpnSpoke(BaseSpoke):
     async def _perf_sample_tick(self, now: float):
         """Take one sample, close ended buckets, store them and push the
         buckets the hub hasn't received yet."""
-        # The hub's firewall id names the series; no id means not configured yet.
-        device_id = (self.config or {}).get("id")
-        if device_id and self.engine.is_configured():
-            res = await self.engine.get_perf_sample()
+        # Sample every configured firewall; the hub's firewall id names its series.
+        for fw in self._all_targets():
+            if not (fw.id and fw.engine.is_configured()):
+                continue
+            res = await fw.engine.get_perf_sample()
             if res.get("status") == "SUCCESS":
                 sample = res["data"]
                 # Rates need the previous counters; gauges are used as they are.
                 metrics = dict(sample["metrics"])
-                metrics.update(counter_rates(self._perf_prev, sample))
+                metrics.update(counter_rates(fw.perf_prev, sample))
                 # A sample without counters must not replace good ones.
                 if sample.get("interfaces"):
-                    self._perf_prev = sample
+                    fw.perf_prev = sample
                 if metrics:
-                    self.perf.add(device_id, metrics, now)
+                    self.perf.add(fw.id, metrics, now)
         closed = self.perf.close_finished(now)
         if closed:
             await asyncio.to_thread(self.perf_store.add, closed, now)
@@ -193,85 +265,56 @@ class OpnSpoke(BaseSpoke):
 
     async def refresh_cache(self) -> Dict[str, Any]:
         """Triggers a full update of all cacheable API responses."""
-        # No firewall configured → nothing to refresh. Skip the whole sweep so
-        # an unconfigured spoke doesn't emit per-endpoint / [sync-error] noise;
-        # _log_unconfigured throttles the single "no firewall configured" line.
-        # Unconfigured: nothing to refresh.
-        if not self.engine.is_configured():
+        # Refresh every configured firewall; the default one's results keep
+        # their old place, the others are listed by firewall id.
+        if not any(fw.engine.is_configured() for fw in self._all_targets()):
+            # No firewall configured: skip the sweep so an unconfigured spoke
+            # logs one throttled "no firewall configured" line, not one per endpoint.
             self.engine._log_unconfigured()
             return {}
+        results = {"status": "SUCCESS", "refreshed": await self._refresh_target(self._default)}
+        others = {fw.id: await self._refresh_target(fw) for fw in self._targets.values()}
+        if others:
+            results["firewalls"] = others
+        return results
+
+    async def _refresh_target(self, fw: FirewallTarget) -> Dict[str, str]:
+        """Re-read every cacheable endpoint of one firewall into its cache.
+        Returns the per-command outcome."""
+        if not fw.engine.is_configured():
+            return {}
         # Commands to cache and the engine method for each.
+        engine = fw.engine
         cache_map = {
-            "GET_INTERFACE_STATUS": self.engine.get_interface_status,
-            "GET_SYSTEM_HEALTH": self.engine.get_system_health,
+            "GET_INTERFACE_STATUS": engine.get_interface_status,
+            "GET_SYSTEM_HEALTH": engine.get_system_health,
             # OPNSENSE_GET_DHCP_LEASES is intentionally NOT in the refresh sweep:
             # handle_command's cache_map excludes it (leases are volatile and a
             # 1h-cached empty list rendered the DHCP tab empty; see the comment
-            # in handle_command). Refreshing it here was a wasted curl whose
-            # result was stored in self._cache but never served.
-            "OPNSENSE_GET_ARP_TABLE": self.engine.get_arp_table,
-            "OPNSENSE_GET_ALL_RULES": self.engine.get_all_firewall_rules,
-            "OPNSENSE_GET_FIREWALL_STATS": self.engine.get_firewall_stats,
-            "OPNSENSE_GET_NAT_POLICIES": self.engine.get_nat_policies,
-            "OPNSENSE_GET_DNS_RECORDS": self.engine.get_dns_records,
-            "OPNSENSE_GET_ALIASES": self.engine.get_all_aliases,
+            # in handle_command).
+            "OPNSENSE_GET_ARP_TABLE": engine.get_arp_table,
+            "OPNSENSE_GET_ALL_RULES": engine.get_all_firewall_rules,
+            "OPNSENSE_GET_FIREWALL_STATS": engine.get_firewall_stats,
+            "OPNSENSE_GET_NAT_POLICIES": engine.get_nat_policies,
+            "OPNSENSE_GET_DNS_RECORDS": engine.get_dns_records,
+            "OPNSENSE_GET_ALIASES": engine.get_all_aliases,
         }
 
         # Refresh each; one failure does not stop the rest.
         results = {}
         for cmd, method in cache_map.items():
             try:
-                # Call the method.
-                res = await method()
-                # Only cache if the result was a success
+                res = fw.store(cmd, await method())
+                # Only successes are cached; note the error otherwise.
                 if isinstance(res, dict) and res.get("status") == "SUCCESS":
-                    self._cache[cmd] = res
-                    self._cache_ts[cmd] = time.time()
                     results[cmd] = "OK"
                 else:
-                    # Not cached: note the error.
                     results[cmd] = f"Error: {res.get('message') if isinstance(res, dict) else res}"
             except Exception as e:
                 # Method raised.
-                logger.error(f"Failed to refresh cache for {cmd}: {e}")
+                logger.error(f"Failed to refresh cache for {cmd} on firewall {fw.id}: {e}")
                 results[cmd] = f"Exception: {str(e)}"
-
-        # Per-command results.
-        return {"status": "SUCCESS", "refreshed": results}
-
-    def _cache_live(self, cmd: str, res: Dict[str, Any]) -> Dict[str, Any]:
-        """Store a live-fetched cacheable result so the next call hits the cache
-        instead of re-doing the slow live round-trip. Only caches SUCCESS (mirrors
-        refresh_cache). Best-effort: returns ``res`` unchanged regardless."""
-        # Store only successes, with a timestamp.
-        if isinstance(res, dict) and res.get("status") == "SUCCESS":
-            self._cache[cmd] = res
-            self._cache_ts[cmd] = time.time()
-        # Pass the result through.
-        return res
-
-    def _cache_get_fresh(self, key: str):
-        """Return the cached value for ``key`` only if present AND younger than
-        ``_cache_ttl``; otherwise ``None`` (caller should fetch live). Bounds how
-        stale a read can be — the refresh loop (1h) and _cache_live populate the
-        cache, and without this the read served arbitrarily old data."""
-        # Fresh enough?
-        if key in self._cache and (time.time() - self._cache_ts.get(key, 0)) < self._cache_ttl:
-            return self._cache[key]
-        # Missing or stale.
-        return None
-
-    def _invalidate_on_write(self, res: Dict[str, Any], keys) -> Dict[str, Any]:
-        """After a successful write, drop the cached GET responses it affects so
-        the next read re-fetches live instead of serving the pre-change list for
-        up to the refresh interval. Best-effort: returns ``res`` unchanged."""
-        # Drop the affected keys after a successful write.
-        if isinstance(res, dict) and res.get("status") == "SUCCESS":
-            for k in keys:
-                self._cache.pop(k, None)
-                self._cache_ts.pop(k, None)
-        # Pass the result through.
-        return res
+        return results
 
     async def _install_cert_on_devices(self, data: Dict[str, Any], devices: list) -> Dict[str, Any]:
         """Import a certificate on each listed firewall in parallel and summarise the results."""
@@ -318,7 +361,8 @@ class OpnSpoke(BaseSpoke):
         """Dispatch a hub command to the matching OPNsense engine action.
 
         Routes ``OPNSENSE_*`` / ``GET_*`` commands (sent hub → spoke over the
-        WebSocket) to ``OpnsenseEngine`` methods against the configured firewall.
+        WebSocket) to ``OpnsenseEngine`` methods against the firewall named by
+        ``data["firewall_id"]`` (the default firewall when there is none).
         Read-heavy commands are served from the in-memory cache primed by
         ``_cache_refresh_loop`` (DHCP leases are the deliberate uncached
         exception); writes go straight to the live API. Sensitive fields
@@ -354,6 +398,15 @@ class OpnSpoke(BaseSpoke):
             # Store the new config.
             logger.info(f"Updating OPNsense configuration: {log_data}")
             self.config = data
+            # A list with no default id: the hub has no firewall bound to this
+            # spoke any more (the last one was deleted or moved). Forget every
+            # firewall and its credentials. Older hubs never send `firewalls`.
+            if "firewalls" in data and not data.get("id") and not data.get("firewalls"):
+                self.engine.host = self.engine.api_key = self.engine.api_secret = None
+                self._default = FirewallTarget(None, self.engine, self._cache_ttl)
+                self._targets = {}
+                logger.info("OPNsense spoke has no firewall bound; cleared")
+                return {"status": "SUCCESS", "message": "OPNsense configuration cleared by Hub"}
             # Update engine credentials if they are provided
             # Connection fields given: update the engine.
             if any(k in data for k in ["opn_host", "host", "opn_port", "port", "api_key", "api_secret"]):
@@ -366,7 +419,12 @@ class OpnSpoke(BaseSpoke):
                 port = str(data.get("opn_port") or data.get("port") or cur_p)
                 # Stay unconfigured (host=None) until a real host is supplied —
                 # never fall back to a localhost default.
-                self.engine.host = f"{host}:{port}" if host else None
+                new_host = f"{host}:{port}" if host else None
+                # A different box: its cached reads belong to the old one.
+                if new_host != self.engine.host:
+                    self._default.cache.clear()
+                    self._default.cache_ts.clear()
+                self.engine.host = new_host
                 # Use `or` (not dict.get(key, default)) so a falsy/explicit-null
                 # api_key/api_secret in the payload can't silently wipe
                 # already-configured credentials — the spoke would then
@@ -374,6 +432,13 @@ class OpnSpoke(BaseSpoke):
                 # successful UPDATE_CONFIG.
                 self.engine.api_key = data.get("api_key") or self.engine.api_key
                 self.engine.api_secret = data.get("api_secret") or self.engine.api_secret
+            # The default firewall's hub id (kept when a partial update omits it).
+            self._default.id = data.get("id") or self._default.id
+            # Every firewall bound to this spoke (newer hubs); older hubs send
+            # only the default one, which leaves the list untouched.
+            if "firewalls" in data:
+                self._set_firewalls(data.get("firewalls"))
+                logger.info("OPNsense spoke manages %d firewall(s)", len(self._all_targets()))
 
             # Update refresh interval and restart loop if provided
             # New refresh interval: apply and restart the loop.
@@ -388,6 +453,16 @@ class OpnSpoke(BaseSpoke):
             # Done.
             return {"status": "SUCCESS", "message": "OPNsense configuration updated from Hub"}
 
+        # The firewall this command is for; an id we don't manage is an error,
+        # never a silent fallback to another box.
+        fw = self._target_for(data)
+        if fw is None:
+            logger.warning("%s for unknown firewall %s", normalized_cmd, data.get("firewall_id"))
+            return {"status": "ERROR",
+                    "message": f"Firewall {data.get('firewall_id')} is not configured on this "
+                               "spoke yet (re-save it in Setup → Firewalls)"}
+        engine = fw.engine
+
         # Performance history (5-minute averages) for a start/end range.
         if normalized_cmd == "OPNSENSE_GET_PERF_HISTORY":
             rng = data or {}
@@ -396,7 +471,7 @@ class OpnSpoke(BaseSpoke):
                 start = float(rng.get("start") or end - 86400)
             except (TypeError, ValueError):
                 return {"status": "ERROR", "message": "start/end must be epoch seconds"}
-            device_id = (self.config or {}).get("id") or ""
+            device_id = fw.id or ""
             rows = await asyncio.to_thread(self.perf_store.history, device_id, start, end)
             return {"status": "SUCCESS", "interval": 300, "data": rows,
                     "message": f"{len(rows)} 5-minute average(s)"}
@@ -423,7 +498,7 @@ class OpnSpoke(BaseSpoke):
                 # Bad limit.
                 limit = 200
             # Live, full lease list.
-            return await self.engine.get_dhcp_leases(limit=limit)
+            return await engine.get_dhcp_leases(limit=limit)
 
         # Check if command is cacheable and has a cached value
         cache_map = {
@@ -449,38 +524,38 @@ class OpnSpoke(BaseSpoke):
 
         if normalized_cmd in cache_map:
             # Serve a fresh cached copy if there is one.
-            fresh = self._cache_get_fresh(normalized_cmd)
+            fresh = fw.get_fresh(normalized_cmd)
             if fresh is not None:
                 logger.debug(f"Returning cached data for {normalized_cmd}")
                 return fresh
             # Stale or cold → fall through to the live fetch below (which
-            # re-caches via _cache_live). Nothing older than _cache_ttl is served.
+            # re-caches via fw.store). Nothing older than _cache_ttl is served.
 
         if normalized_cmd == "PROBE_API":
             # Raw GET of a given API path.
             path = data.get("path")
             if not path:
                 return {"status": "ERROR", "message": "Missing path for PROBE_API"}
-            return await self.engine._request("GET", path)
+            return await engine._request("GET", path)
 
         if normalized_cmd == "OPNSENSE_UPDATE_ALIAS":
             # Data expected: {"name": "web_servers", "hosts": ["1.1.1.1", "2.2.2.2"]}
             # Replace an alias's hosts, then drop the cached alias list.
-            return self._invalidate_on_write(
-                await self.engine.manage_alias(data.get("name"), data.get("hosts"), action="update"),
+            return fw.invalidate(
+                await engine.manage_alias(data.get("name"), data.get("hosts"), action="update"),
                 ["OPNSENSE_GET_ALIASES"])
 
         elif normalized_cmd == "GET_INTERFACE_STATUS":
             # Live interface status, cached.
-            return self._cache_live(normalized_cmd, await self.engine.get_interface_status())
+            return fw.store(normalized_cmd, await engine.get_interface_status())
 
         elif normalized_cmd == "GET_SYSTEM_HEALTH":
             # Live system health, cached.
-            return self._cache_live(normalized_cmd, await self.engine.get_system_health())
+            return fw.store(normalized_cmd, await engine.get_system_health())
 
         elif normalized_cmd == "OPNSENSE_GET_OVERVIEW":
             # Live dashboard stats; the hub cache already bounds how often this runs.
-            return await self.engine.get_overview()
+            return await engine.get_overview()
 
         elif normalized_cmd == "OPNSENSE_GET_RULES_BY_IP":
             # Reuse the cached OPNSENSE_GET_ALL_RULES result when present
@@ -490,7 +565,7 @@ class OpnSpoke(BaseSpoke):
             # for nothing. Fall back to a live fetch if the cache is cold.
             # Filter the cached ruleset by IP.
             ip = data.get("ip", "")
-            cached_rules = self._cache_get_fresh("OPNSENSE_GET_ALL_RULES")
+            cached_rules = fw.get_fresh("OPNSENSE_GET_ALL_RULES")
             if cached_rules and cached_rules.get("status") == "SUCCESS":
                 rules = cached_rules.get("data", [])
                 # Guard against a non-list.
@@ -504,12 +579,12 @@ class OpnSpoke(BaseSpoke):
                 return {"status": "SUCCESS", "ip": ip, "rules": filtered,
                         "source": "cache"}
             # Cache cold: live lookup.
-            return await self.engine.get_rules_for_ip(ip)
+            return await engine.get_rules_for_ip(ip)
 
         elif normalized_cmd == "OPNSENSE_CURL_TEST":
             try:
                 # Run curl against the OPNsense host
-                cmd = ["curl", "-k", f"https://{self.engine.host}/"]
+                cmd = ["curl", "-k", f"https://{engine.host}/"]
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
                 return {
                     "status": "SUCCESS",
@@ -522,30 +597,30 @@ class OpnSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": f"Curl test failed: {str(e)}"}
         elif normalized_cmd == "OPNSENSE_GET_DHCP_LEASES":
             # Live DHCP leases.
-            return await self.engine.get_dhcp_leases()
+            return await engine.get_dhcp_leases()
 
         elif normalized_cmd == "OPNSENSE_GET_ARP_TABLE":
             # Live reads, cached for next time.
-            return self._cache_live(normalized_cmd, await self.engine.get_arp_table())
+            return fw.store(normalized_cmd, await engine.get_arp_table())
 
         elif normalized_cmd == "OPNSENSE_GET_ALL_RULES":
-            return self._cache_live(normalized_cmd, await self.engine.get_all_firewall_rules())
+            return fw.store(normalized_cmd, await engine.get_all_firewall_rules())
 
         elif normalized_cmd == "OPNSENSE_GET_FIREWALL_STATS":
-            return self._cache_live(normalized_cmd, await self.engine.get_firewall_stats())
+            return fw.store(normalized_cmd, await engine.get_firewall_stats())
 
         elif normalized_cmd == "OPNSENSE_GET_NAT_POLICIES":
-            return self._cache_live(normalized_cmd, await self.engine.get_nat_policies())
+            return fw.store(normalized_cmd, await engine.get_nat_policies())
 
         elif normalized_cmd == "OPNSENSE_GET_DNS_RECORDS":
-            return self._cache_live(normalized_cmd, await self.engine.get_dns_records())
+            return fw.store(normalized_cmd, await engine.get_dns_records())
 
         elif normalized_cmd == "OPNSENSE_GET_ALIASES":
-            return self._cache_live(normalized_cmd, await self.engine.get_all_aliases())
+            return fw.store(normalized_cmd, await engine.get_all_aliases())
 
         elif normalized_cmd == "OPNSENSE_ADD_ALIAS":
             # Writes: run, then drop the cached lists they change.
-            return self._invalidate_on_write(await self.engine.add_alias(
+            return fw.invalidate(await engine.add_alias(
                 data.get("name", ""),
                 data.get("type", "host"),
                 data.get("content", ""),
@@ -554,34 +629,34 @@ class OpnSpoke(BaseSpoke):
             ), ["OPNSENSE_GET_ALIASES"])
 
         elif normalized_cmd == "OPNSENSE_DEL_ALIAS":
-            return self._invalidate_on_write(
-                await self.engine.delete_alias(data.get("uuid", "")),
+            return fw.invalidate(
+                await engine.delete_alias(data.get("uuid", "")),
                 ["OPNSENSE_GET_ALIASES"])
 
         elif normalized_cmd == "OPNSENSE_ADD_RULE":
-            return self._invalidate_on_write(
-                await self.engine.add_firewall_rule_and_apply(data.get("rule", {})),
+            return fw.invalidate(
+                await engine.add_firewall_rule_and_apply(data.get("rule", {})),
                 ["OPNSENSE_GET_ALL_RULES", "OPNSENSE_GET_RULES_BY_IP"])
 
         elif normalized_cmd == "OPNSENSE_DEL_RULE":
-            return self._invalidate_on_write(
-                await self.engine.delete_firewall_rule_and_apply(data.get("rule_id", "")),
+            return fw.invalidate(
+                await engine.delete_firewall_rule_and_apply(data.get("rule_id", "")),
                 ["OPNSENSE_GET_ALL_RULES", "OPNSENSE_GET_RULES_BY_IP"])
 
         elif normalized_cmd == "OPNSENSE_ADD_NAT_RULE":
-            return self._invalidate_on_write(await self.engine.add_nat_rule(
+            return fw.invalidate(await engine.add_nat_rule(
                 data.get("nat_type", "d_nat"),
                 data.get("rule", {})
             ), ["OPNSENSE_GET_NAT_POLICIES"])
 
         elif normalized_cmd == "OPNSENSE_DEL_NAT_RULE":
-            return self._invalidate_on_write(await self.engine.delete_nat_rule(
+            return fw.invalidate(await engine.delete_nat_rule(
                 data.get("nat_type", "d_nat"),
                 data.get("uuid", "")
             ), ["OPNSENSE_GET_NAT_POLICIES"])
 
         elif normalized_cmd == "OPNSENSE_ADD_DNS_RECORD":
-            return self._invalidate_on_write(await self.engine.add_dns_record(
+            return fw.invalidate(await engine.add_dns_record(
                 data.get("hostname", ""),
                 data.get("domain", ""),
                 data.get("ip", ""),
@@ -589,18 +664,18 @@ class OpnSpoke(BaseSpoke):
             ), ["OPNSENSE_GET_DNS_RECORDS"])
 
         elif normalized_cmd == "OPNSENSE_DEL_DNS_RECORD":
-            return self._invalidate_on_write(
-                await self.engine.delete_dns_record(data.get("uuid", "")),
+            return fw.invalidate(
+                await engine.delete_dns_record(data.get("uuid", "")),
                 ["OPNSENSE_GET_DNS_RECORDS"])
 
         elif normalized_cmd == "OPNSENSE_EDIT_RULE":
-            return self._invalidate_on_write(await self.engine.edit_firewall_rule(
+            return fw.invalidate(await engine.edit_firewall_rule(
                 data.get("uuid", ""),
                 data.get("rule", {})
             ), ["OPNSENSE_GET_ALL_RULES", "OPNSENSE_GET_RULES_BY_IP"])
 
         elif normalized_cmd == "OPNSENSE_EDIT_ALIAS":
-            return self._invalidate_on_write(await self.engine.edit_alias(
+            return fw.invalidate(await engine.edit_alias(
                 data.get("uuid", ""),
                 data.get("name", ""),
                 data.get("type", "host"),
@@ -610,14 +685,14 @@ class OpnSpoke(BaseSpoke):
             ), ["OPNSENSE_GET_ALIASES"])
 
         elif normalized_cmd == "OPNSENSE_EDIT_NAT_RULE":
-            return self._invalidate_on_write(await self.engine.edit_nat_rule(
+            return fw.invalidate(await engine.edit_nat_rule(
                 data.get("nat_type", "d_nat"),
                 data.get("uuid", ""),
                 data.get("rule", {})
             ), ["OPNSENSE_GET_NAT_POLICIES"])
 
         elif normalized_cmd == "OPNSENSE_EDIT_DNS_RECORD":
-            return self._invalidate_on_write(await self.engine.edit_dns_record(
+            return fw.invalidate(await engine.edit_dns_record(
                 data.get("uuid", ""),
                 data.get("hostname", ""),
                 data.get("domain", ""),
@@ -629,16 +704,16 @@ class OpnSpoke(BaseSpoke):
         # plugin). Few objects and always read live, so not cached.
         elif normalized_cmd == "OPNSENSE_GET_IMPAIRMENTS":
             # Impairments: list, add, edit, delete.
-            return await impairments.list_impairments(self.engine)
+            return await impairments.list_impairments(engine)
 
         elif normalized_cmd == "OPNSENSE_ADD_IMPAIRMENT":
-            return await impairments.add_impairment(self.engine, data)
+            return await impairments.add_impairment(engine, data)
 
         elif normalized_cmd == "OPNSENSE_EDIT_IMPAIRMENT":
-            return await impairments.edit_impairment(self.engine, data.get("uuid", ""), data)
+            return await impairments.edit_impairment(engine, data.get("uuid", ""), data)
 
         elif normalized_cmd == "OPNSENSE_DEL_IMPAIRMENT":
-            return await impairments.delete_impairment(self.engine, data.get("uuid", ""))
+            return await impairments.delete_impairment(engine, data.get("uuid", ""))
 
         elif normalized_cmd in ("INSTALL_CERT", "OPNSENSE_INSTALL_CERT"):
             # NOTE: the hub (cert_distribution.py) pushes a BARE ``INSTALL_CERT``
@@ -658,7 +733,7 @@ class OpnSpoke(BaseSpoke):
             devices = [d for d in (data.get("devices") or []) if isinstance(d, dict) and d.get("host")]
             # None listed: import on this spoke's own firewall.
             if not devices:
-                return await self.engine.import_cert(
+                return await engine.import_cert(
                     data.get("domain", ""),
                     data.get("fullchain", ""),
                     data.get("privkey", ""),
@@ -675,7 +750,7 @@ class OpnSpoke(BaseSpoke):
             # hub to have pre-filtered.
             # Search term; scoping is done in the engine.
             q = data.get("q", "").strip()
-            return await self.engine.search_dhcp(
+            return await engine.search_dhcp(
                 q,
                 prefixes=data.get("prefixes") or [],
                 is_admin=bool(data.get("is_admin")),
@@ -704,11 +779,11 @@ class OpnSpoke(BaseSpoke):
         has primed it (avoids a fresh curl on every hub heartbeat/status poll)
         and falls back to a live fetch when the cache is cold or stale."""
         # Cached health if primed, else a live fetch.
-        cached = self._cache.get("GET_SYSTEM_HEALTH")
+        cached = self._default.cache.get("GET_SYSTEM_HEALTH")
         if cached and cached.get("status") == "SUCCESS":
             health = cached
         else:
-            health = self._cache_live(
+            health = self._default.store(
                 "GET_SYSTEM_HEALTH", await self.engine.get_system_health())
         # Status report.
         return {
