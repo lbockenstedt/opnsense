@@ -398,6 +398,15 @@ class OpnSpoke(BaseSpoke):
             # Store the new config.
             logger.info(f"Updating OPNsense configuration: {log_data}")
             self.config = data
+            # A list with no default id: the hub has no firewall bound to this
+            # spoke any more (the last one was deleted or moved). Forget every
+            # firewall and its credentials. Older hubs never send `firewalls`.
+            if "firewalls" in data and not data.get("id") and not data.get("firewalls"):
+                self.engine.host = self.engine.api_key = self.engine.api_secret = None
+                self._default = FirewallTarget(None, self.engine, self._cache_ttl)
+                self._targets = {}
+                logger.info("OPNsense spoke has no firewall bound; cleared")
+                return {"status": "SUCCESS", "message": "OPNsense configuration cleared by Hub"}
             # Update engine credentials if they are provided
             # Connection fields given: update the engine.
             if any(k in data for k in ["opn_host", "host", "opn_port", "port", "api_key", "api_secret"]):

@@ -97,3 +97,13 @@ def test_default_cache_is_dropped_when_its_address_changes():
     assert spoke._default.cache
     _run(spoke.handle_command("UPDATE_CONFIG", {"opn_host": "10.0.0.7"}))
     assert spoke._default.cache == {}
+
+
+def test_empty_list_without_a_default_clears_every_firewall():
+    """The hub unbound the last firewall: the spoke forgets every box and its
+    credentials instead of keeping the old connection."""
+    spoke = _spoke()
+    _run(spoke.handle_command("UPDATE_CONFIG", {"firewalls": []}))
+    assert spoke._targets == {} and spoke._default.id is None
+    assert (spoke.engine.host, spoke.engine.api_key, spoke.engine.api_secret) == (None, None, None)
+    assert _run(spoke.handle_command("GET_SYSTEM_HEALTH", {"firewall_id": "fw-2"}))["status"] == "ERROR"
