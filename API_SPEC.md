@@ -7,8 +7,21 @@ The OPNsense Spoke acts as a bridge between the Lab Manager Hub and the OPNsense
 ### Management
 - **`UPDATE_CONFIG`**
   - **Purpose**: Updates the connection details for the OPNsense engine.
-  - **Payload**: `{"opn_host": "string", "api_key": "string", "api_secret": "string"}`
+  - **Payload**: `{"id": "string", "opn_host": "string", "api_key": "string", "api_secret": "string", "firewalls": [{"id", "host", "port", "api_key", "api_secret"}, ...]}`
+    - The top-level fields are the **default firewall**. `firewalls` (optional,
+      sent by newer hubs) lists **every** firewall bound to this spoke, for
+      example both boxes of an HA pair. Leaving it out keeps the current list.
+      `{"firewalls": []}` with no `id` means no firewall is bound to this
+      spoke any more: the spoke forgets every firewall and its credentials.
   - **Response**: `{"status": "SUCCESS", "message": "..."}`
+
+### Choosing the firewall (`firewall_id`)
+Every other command may carry `"firewall_id": "<hub firewall id>"`. The spoke
+runs it against that firewall, with a separate read cache per firewall. With
+no `firewall_id` the command goes to the default firewall, so older hubs keep
+working. An id the spoke was never given returns
+`{"status": "ERROR", "message": "Firewall <id> is not configured on this spoke ..."}`;
+the command never falls back to another firewall.
 
 ### Firewall Rule Management
 - **`OPNSENSE_ADD_RULE`**

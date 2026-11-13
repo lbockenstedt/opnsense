@@ -78,9 +78,12 @@ def test_add_both_directions_builds_pipes_rules_and_impairments():
                        "enabled": True, "direction": "both", "complete": True}]
 
 
-def test_failed_step_rolls_back_everything():
+def test_failed_step_rolls_back_everything(caplog):
     fw = FakeOpnsense(fail_on="add_impairment")
-    res = _run(impairments.add_impairment(fw, SPEC))
+    with caplog.at_level("WARNING", logger="OpnSpoke.impairments"):
+        res = _run(impairments.add_impairment(fw, SPEC))
+    # The log names the failing endpoint and the full OPNsense reply.
+    assert "netimpair/settings/add_impairment" in caplog.text and "bad value" in caplog.text
     assert res["status"] == "ERROR" and "bad value" in res["message"]
     assert all(not store for store in fw.objects.values())
     assert fw.applied == []
